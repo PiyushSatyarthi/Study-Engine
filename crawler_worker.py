@@ -44,6 +44,7 @@ def index_topic(topic):
         doc = {
             "title": r["title"],
             "summary": r["summary"],
+            "ai_summary": None,
             "type": r["type"],
             "source": r["source"],
             "pdf": r["pdf"],

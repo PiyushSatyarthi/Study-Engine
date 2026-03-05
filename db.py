@@ -1,7 +1,11 @@
+import os
 from pymongo import MongoClient
-
-client = MongoClient("mongodb+srv://2025191453piyush_db_user:Nwle96FedSr6TGEV@cluster0.smtpjro.mongodb.net/?appName=Cluster0")
+from dotenv import load_dotenv
+load_dotenv()
+client = MongoClient(os.getenv("MONGO_URI"))
 
 db = client["study_engine"]
 
 resources = db["resources"]
+payments = db["payments"]
+users = db["users"]
