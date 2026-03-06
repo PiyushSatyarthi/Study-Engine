@@ -19,26 +19,21 @@ SEED_TOPICS = [
     "distributed systems"
 ]
 
+CRAWL_INTERVAL = 120    # 2 min between topics (was 60s — too aggressive)
+CYCLE_SLEEP = 7200      # 2 hours between full cycles (was 1 hour)
 
 def background_indexer():
-
     while True:
-
         for topic in SEED_TOPICS:
-
             try:
-                print(f"[Indexer] Crawling topic: {topic}")
+                print(f"[Indexer] Crawling: {topic}")
                 index_topic(topic)
-
             except Exception as e:
                 print("Indexer error:", e)
+            time.sleep(CRAWL_INTERVAL)
 
-            # wait a bit between crawls
-            time.sleep(60)
-
-        # full cycle delay
-        print("[Indexer] Sleeping before next crawl cycle...")
-        time.sleep(3600)
+        print("[Indexer] Cycle complete. Sleeping...")
+        time.sleep(CYCLE_SLEEP)
 
 
 def main():
