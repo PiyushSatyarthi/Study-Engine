@@ -91,6 +91,7 @@ def build_page(query: str, results: list, page: int):
 # ── /start ────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_username = os.getenv("ADMIN_USERNAME", "@admin")
     await update.message.reply_text(
         "📚 Study Engine Bot\n\n"
         "Find academic papers instantly.\n\n"
@@ -106,9 +107,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/collections — manage collections (premium)\n"
         "/setalert <topic> — new paper alerts (premium)\n"
         "/digest [HH:MM] — daily digest (premium)\n"
-        "/premium — upgrade"
+        "/premium — upgrade\n\n"
+        f"Need help? Contact {admin_username}"
     )
-
 
 # ── /study ────────────────────────────────────────────────────
 
