@@ -78,7 +78,12 @@ def keyword_search(query: str, limit: int = 40):
 
 def fallback_search(query: str, limit: int = 40):
     """Regex fallback when both vector and keyword return nothing."""
-    tokens = [t for t in query.lower().split() if t not in STOPWORDS and len(t) > 3]
+    import re
+    raw = re.split(r'[\s\-]+', query.lower())
+    tokens = list(dict.fromkeys(
+        t.strip(".,;:()") for t in raw
+        if t.strip(".,;:()") and t.strip(".,;:()") not in STOPWORDS and len(t.strip(".,;:()")) > 3
+    ))
     if not tokens:
         return []
     conditions = []
@@ -148,11 +153,12 @@ def score_result(r: dict, tokens: list[str]) -> float:
 
 def dynamic_threshold(tokens: list[str]) -> float:
     """
-    Stricter threshold for longer, more specific queries.
-    - 1 token:  0.3  (very lenient)
+    Stricter threshold for longer queries, but capped so very long
+    queries don't become impossible to satisfy.
+    - 1 token:  0.3
     - 2 tokens: 0.4
     - 3 tokens: 0.5
-    - 4+ tokens: 0.6 (strict — must match most of the query)
+    - 4+ tokens: 0.55 (capped — long queries have diminishing returns)
     """
     n = len(tokens)
     if n <= 1:
@@ -162,7 +168,7 @@ def dynamic_threshold(tokens: list[str]) -> float:
     elif n == 3:
         return 0.5
     else:
-        return 0.6
+        return 0.55  # capped: 4+ token queries shouldn't need 60%+ match
 
 
 def relevance_filter(results, query: str):
@@ -171,10 +177,17 @@ def relevance_filter(results, query: str):
     Applies a dynamic threshold based on query length.
     Returns (filtered_results, needs_crawl).
     """
-    tokens = [
-        t for t in query.lower().split()
-        if t not in STOPWORDS and len(t) > 3
-    ]
+    import re
+    # Split on spaces AND hyphens so "liquid-liquid" becomes ["liquid", "liquid"]
+    raw_tokens = re.split(r'[\s\-]+', query.lower())
+    # Deduplicate while preserving order, drop stopwords and short tokens
+    seen = set()
+    tokens = []
+    for t in raw_tokens:
+        t = t.strip(".,;:()")
+        if t and t not in STOPWORDS and len(t) > 3 and t not in seen:
+            seen.add(t)
+            tokens.append(t)
 
     if not tokens:
         return results, False
@@ -205,6 +218,55 @@ def relevance_filter(results, query: str):
     print(f"[search] needs_crawl={needs_crawl} (top_score={top_score:.2f}, passed={len(filtered)})")
 
     return filtered, needs_crawl
+
+
+
+def search_related(query: str, current_pdf: str, limit: int = 5):
+    """
+    Find related papers using a clean short query (topic field from DB).
+    Uses lenient single-token matching — just needs 1 key term to match.
+    """
+    print(f"[search] Related query: '{query}'")
+
+    if not query:
+        return []
+
+    vector_results = vector_search(query, limit=20)
+    keyword_results = keyword_search(query, limit=20)
+
+    if not vector_results and not keyword_results:
+        candidates = fallback_search(query, limit=20)
+    else:
+        candidates = hybrid_rank(vector_results, keyword_results, limit=20)
+
+    # Remove the paper itself from results
+    candidates = [r for r in candidates if r.get("pdf") != current_pdf]
+
+    # Get meaningful tokens from the topic query
+    import re as _re
+    raw = _re.split(r'[\s\-]+', query.lower())
+    tokens = list(dict.fromkeys(
+        t.strip(".,;:()") for t in raw
+        if t.strip(".,;:()") and t.strip(".,;:()") not in STOPWORDS and len(t.strip(".,;:()")) > 3
+    ))
+
+    if not tokens:
+        return candidates[:limit]
+
+    # Require at least 1 token match — very lenient, just confirms relevance
+    scored = []
+    for r in candidates:
+        text = (r.get("title", "") + " " + r.get("summary", "")).lower()
+        match = any(
+            _re.search(r'(?<![a-z])' + _re.escape(t) + r'(?![a-z])', text)
+            for t in tokens
+        )
+        if match:
+            scored.append(r)
+
+    print(f"[search] Related papers found: {len(scored[:limit])}")
+    return scored[:limit]
+
 
 
 def search(query: str, limit: int = 20):
