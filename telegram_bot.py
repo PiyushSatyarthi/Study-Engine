@@ -1,11 +1,12 @@
 from datetime import datetime, timedelta, timezone
 import threading
 import os
+import asyncio
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler,
-    CommandHandler, ContextTypes
+    CommandHandler, ContextTypes, MessageHandler, filters
 )
 
 from db import resources, sessions, users
@@ -20,6 +21,7 @@ from users import (
     get_digest_time, set_digest_time, now_utc
 )
 from llm_summarizer import summarize_text
+from assignment_analyzer import analyze_assignment
 
 from features.saved_papers import save_paper, unsave_paper, get_saved_papers, add_note
 from features.collections_feature import create_collection, delete_collection, list_collections
@@ -40,6 +42,9 @@ crawling_in_progress = set()
 crawl_cooldowns = {}
 crawling_lock = threading.Lock()
 CRAWL_COOLDOWN_SECONDS = 600
+
+# Tracks users who sent /assignment and are waiting to send their content
+assignment_sessions = {}
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -103,6 +108,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/summarize <link> — AI summary (premium)\n"
         "/ask <link> <question> — ask a paper (premium)\n"
         "/compare <l1> <l2> — compare papers (premium)\n"
+        "/assignment — analyze your assignment (premium)\n"
         "/export — export saves as PDF (premium)\n"
         "/collections — manage collections (premium)\n"
         "/setalert <topic> — new paper alerts (premium)\n"
@@ -110,6 +116,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/premium — upgrade\n\n"
         f"Need help? Contact {admin_username}"
     )
+
 
 # ── /study ────────────────────────────────────────────────────
 
@@ -195,7 +202,6 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def crawl_and_notify(query: str, chat_id: int, application,
                             silent: bool = False, user_id: int = None):
-    import asyncio
     try:
         await asyncio.get_event_loop().run_in_executor(None, index_topic, query)
     except Exception as e:
@@ -578,7 +584,7 @@ async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expiry = u.get("premium_expiry")
         await update.message.reply_text(
             f"You have Premium! Expires: {expiry.strftime('%d %b %Y') if expiry else 'N/A'}\n\n"
-            "Commands: /summarize /ask /compare /export /collections /setalert /digest"
+            "Commands: /summarize /ask /compare /export /collections /setalert /digest /assignment"
         )
         return
 
@@ -599,7 +605,8 @@ async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Collections & notes\n"
         "• Topic alerts\n"
         "• Daily digest\n"
-        "• PDF export\n\n"
+        "• PDF export\n"
+        "• Assignment analyzer\n\n"
         f"Pay securely:\n{url}"
     )
 
@@ -622,6 +629,286 @@ async def givepremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Premium granted. User: {target} | Days: {days}")
 
 
+# ── /assignment ───────────────────────────────────────────────
+
+async def assignment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not is_premium(user_id):
+        await update.message.reply_text(
+            "💎 Assignment Analyzer is a Premium feature.\n\n"
+            "Use /premium to upgrade."
+        )
+        return
+
+    assignment_sessions[user_id] = {"step": "waiting_for_content"}
+
+    await update.message.reply_text(
+        "📋 Assignment Analyzer\n\n"
+        "Send me your assignment as:\n"
+        "• Plain text — type or paste your questions\n"
+        "• A PDF file\n\n"
+        "I'll extract all questions and suggest the best topics to read.\n\n"
+        "Send your assignment now 👇"
+    )
+
+
+async def assignment_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Catches text/PDF sent after /assignment.
+    Ignores all other messages so it doesn't interfere with normal bot usage.
+    """
+    user_id = update.effective_user.id
+    session = assignment_sessions.get(user_id)
+
+    # Not in assignment flow — ignore completely
+    if not session or session.get("step") != "waiting_for_content":
+        return
+
+    assignment_text = None
+
+    # ── Plain text ──
+    if update.message.text:
+        text = update.message.text.strip()
+        # Ignore bot commands so /study etc still work even if session is open
+        if text.startswith("/"):
+            assignment_sessions.pop(user_id, None)
+            return
+        if len(text) < 20:
+            await update.message.reply_text(
+                "⚠️ That looks too short. Please send your full assignment questions."
+            )
+            return
+        assignment_text = text
+
+    # ── PDF ──
+    elif update.message.document:
+        doc = update.message.document
+        mime = doc.mime_type or ""
+
+        if mime != "application/pdf":
+            await update.message.reply_text(
+                "⚠️ Only PDF files are supported.\n"
+                "Please send a PDF or paste your questions as text.\n\n"
+                "Images are not supported."
+            )
+            return
+
+        if doc.file_size > 5 * 1024 * 1024:
+            await update.message.reply_text(
+                "⚠️ PDF too large (max 5MB). Please send a smaller file or paste the text."
+            )
+            return
+
+        await update.message.reply_text("📄 Reading your PDF...")
+
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            file_bytes = await tg_file.download_as_bytearray()
+            assignment_text = _extract_pdf_text(bytes(file_bytes))
+
+            if not assignment_text or len(assignment_text.strip()) < 20:
+                await update.message.reply_text(
+                    "⚠️ Could not extract text from this PDF. "
+                    "It may be scanned or image-based. "
+                    "Please paste your questions as text instead."
+                )
+                assignment_sessions.pop(user_id, None)
+                return
+
+        except Exception as e:
+            print(f"[assignment] PDF read error: {e}")
+            await update.message.reply_text(
+                "⚠️ Failed to read the PDF. Please paste your questions as text."
+            )
+            return
+
+    # ── Reject photos ──
+    elif update.message.photo:
+        await update.message.reply_text(
+            "⚠️ Images are not supported.\n"
+            "Please send a PDF or paste your questions as text."
+        )
+        return
+
+    else:
+        return
+
+    # Got content — ask what the user wants
+    assignment_sessions[user_id] = {
+        "step": "choose_mode",
+        "text": assignment_text
+    }
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📚 Topics only", callback_data="assign:topics"),
+            InlineKeyboardButton("✍️ Full answers", callback_data="assign:answers")
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="assign:cancel")]
+    ])
+
+    await update.message.reply_text(
+        "✅ Got your assignment!\n\n"
+        "What would you like?\n\n"
+        "📚 Topics only — map each question to topics and papers to read\n"
+        "✍️ Full answers — generate research-backed answers for each question (takes longer)",
+        reply_markup=keyboard
+    )
+
+
+async def assignment_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    action = query.data.split(":")[1]
+
+    if action == "cancel":
+        assignment_sessions.pop(user_id, None)
+        await query.edit_message_text("❌ Assignment analysis cancelled.")
+        return
+
+    session = assignment_sessions.get(user_id)
+    if not session or "text" not in session:
+        await query.edit_message_text("⚠️ Session expired. Please use /assignment again.")
+        return
+
+    mode = action   # "topics" or "answers"
+    assignment_text = session["text"]
+    assignment_sessions.pop(user_id, None)
+
+    if mode == "topics":
+        await query.edit_message_text(
+            "🔍 Analyzing your assignment and mapping topics...\n\nThis takes about 15–30 seconds."
+        )
+    else:
+        await query.edit_message_text(
+            "🧠 Analyzing and generating research-backed answers...\n\n"
+            "This takes 1–3 minutes depending on how many questions you have.\n"
+            "Results will appear question by question."
+        )
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: analyze_assignment(assignment_text, mode=mode)
+        )
+    except Exception as e:
+        print(f"[assignment] Analysis error: {e}")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="⚠️ Something went wrong during analysis. Please try again."
+        )
+        return
+
+    if result.get("error"):
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"⚠️ {result['error']}"
+        )
+        return
+
+    questions = result.get("questions", [])
+    total = result.get("total", 0)
+
+    # Background crawl task no longer needed — analyzer waits internally for gaps
+
+    if mode == "topics":
+        await _send_topic_map(context.bot, query.message.chat_id, questions, total)
+    else:
+        await _send_answers(context.bot, query.message.chat_id, questions, total)
+
+
+async def _send_topic_map(bot, chat_id: int, questions: list, total: int):
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"📋 Assignment Analysis — {total} question(s) found\n\nTopics to study for each question:"
+    )
+
+    type_emoji = {"factual": "🔬", "essay": "✍️", "numerical": "🔢", "definition": "📖"}
+
+    for q in questions:
+        topics = q.get("topics", [])
+        topic_str = "\n".join(f"  • {t}" for t in topics) if topics else f"  • {q['question']}"
+        emoji = type_emoji.get(q["type"], "❓")
+
+        msg = (
+            f"{emoji} Q{q['number']} [{q['type']}]\n"
+            f"{q['question']}\n\n"
+            f"Topics to read:\n{topic_str}"
+        )
+        await bot.send_message(chat_id=chat_id, text=msg)
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="💡 Want full research-backed answers? Use /assignment again and choose Full answers."
+    )
+
+
+async def _send_answers(bot, chat_id: int, questions: list, total: int):
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"📋 Assignment Analysis — {total} question(s)\nGenerating answers from academic research..."
+    )
+
+    type_emoji = {"factual": "🔬", "essay": "✍️", "numerical": "🔢", "definition": "📖"}
+
+    for q in questions:
+        emoji = type_emoji.get(q["type"], "❓")
+        confidence = q.get("confidence_label", "")
+        papers_found = q.get("papers_found", 0)
+        answer = q.get("answer", "No answer generated.")
+        sources = q.get("sources", [])
+
+        msg = (
+            f"{emoji} Q{q['number']} — {q['type']}\n"
+            f"{q['question']}\n\n"
+            f"{answer}\n"
+        )
+
+        if sources:
+            msg += "\nSources:\n"
+            for s in sources[:3]:
+                title_short = s["title"][:55] + "..." if len(s["title"]) > 55 else s["title"]
+                msg += f"• {title_short}\n  {s['link']}\n"
+
+        if confidence:
+            msg += f"\nConfidence: {confidence} ({papers_found} papers found)"
+
+        if len(msg) > 4000:
+            msg = msg[:3950] + "\n\n(Answer truncated)"
+
+        try:
+            await bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True)
+        except Exception as e:
+            print(f"[assignment] Send error Q{q['number']}: {e}")
+            await bot.send_message(chat_id=chat_id, text=f"Q{q['number']}: {answer[:1000]}")
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    try:
+        import io
+        import PyPDF2
+        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+        return "\n".join(p.extract_text() or "" for p in reader.pages)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[assignment] PyPDF2 error: {e}")
+
+    try:
+        import io
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except Exception as e:
+        print(f"[assignment] pdfplumber error: {e}")
+        return ""
+
+
 # ── App entry ─────────────────────────────────────────────────
 
 _application = None
@@ -640,10 +927,20 @@ def run_bot():
         ("summarize", summarize), ("ask", ask), ("compare", compare),
         ("setalert", setalert), ("removealert", removealert), ("alerts", myalerts),
         ("digest", digest), ("premium", premium), ("givepremium", givepremium),
+        ("assignment", assignment),
     ]
     for name, handler in handlers:
         app.add_handler(CommandHandler(name, handler))
+
     app.add_handler(CallbackQueryHandler(page_callback, pattern="^page:"))
+    app.add_handler(CallbackQueryHandler(assignment_mode_callback, pattern="^assign:"))
+
+    # Catches text and documents ONLY when user is in assignment flow
+    # filters.COMMAND excluded so /study, /save etc are never intercepted
+    app.add_handler(MessageHandler(
+        (filters.TEXT & ~filters.COMMAND) | filters.Document.ALL | filters.PHOTO,
+        assignment_receive
+    ))
 
     async def post_init(application):
         application.create_task(run_digest_scheduler(application))
