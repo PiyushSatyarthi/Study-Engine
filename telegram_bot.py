@@ -814,8 +814,6 @@ async def assignment_mode_callback(update: Update, context: ContextTypes.DEFAULT
     questions = result.get("questions", [])
     total = result.get("total", 0)
 
-    # Background crawl task no longer needed — analyzer waits internally for gaps
-
     if mode == "topics":
         await _send_topic_map(context.bot, query.message.chat_id, questions, total)
     else:

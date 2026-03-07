@@ -3,38 +3,79 @@ import re
 import time
 import requests
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-CHAT_URL = f"{OLLAMA_HOST}/api/chat"
-MODEL = "qwen2.5:7b"   # was qwen2.5:3b
+# ── LLM config ────────────────────────────────────────────────────────────────
+# Set LLM_PROVIDER=groq in .env to use Groq instead of Ollama
+# Groq is ~50x faster and free up to 14400 req/day
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()  # "ollama" | "groq"
 
-# How long to wait for crawler before giving up (seconds)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+OLLAMA_CHAT_URL = f"{OLLAMA_HOST}/api/chat"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Crawl settings
 CRAWL_WAIT_TIMEOUT = 120
 CRAWL_POLL_INTERVAL = 8
 
 
+# ── LLM call (Ollama or Groq) ─────────────────────────────────────────────────
+
 def _call_llm(prompt: str, max_tokens: int = 800, temperature: float = 0.3) -> str:
+    if LLM_PROVIDER == "groq":
+        return _call_groq(prompt, max_tokens, temperature)
+    return _call_ollama(prompt, max_tokens, temperature)
+
+
+def _call_ollama(prompt: str, max_tokens: int, temperature: float) -> str:
     try:
         r = requests.post(
-            CHAT_URL,
+            OLLAMA_CHAT_URL,
             json={
-                "model": MODEL,
+                "model": OLLAMA_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "options": {"num_predict": max_tokens, "temperature": temperature},
                 "stream": False
             },
             timeout=180
         )
-        data = r.json()
-        return data["message"]["content"].strip()
+        return r.json()["message"]["content"].strip()
     except Exception as e:
-        print(f"[assignment] LLM call failed: {e}")
+        print(f"[assignment] Ollama call failed: {e}")
         return ""
 
 
-def _infer_type(question: str) -> str:
-    """Rule-based fallback type detection."""
-    q = question.lower().strip()
+def _call_groq(prompt: str, max_tokens: int, temperature: float) -> str:
+    if not GROQ_API_KEY:
+        print("[assignment] GROQ_API_KEY not set — falling back to Ollama")
+        return _call_ollama(prompt, max_tokens, temperature)
+    try:
+        r = requests.post(
+            GROQ_API_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature
+            },
+            timeout=30
+        )
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[assignment] Groq call failed: {e} — falling back to Ollama")
+        return _call_ollama(prompt, max_tokens, temperature)
 
+
+# ── Question type inference ───────────────────────────────────────────────────
+
+def _infer_type(question: str) -> str:
+    q = question.lower().strip()
     numerical_kw = ("calculate", "compute", "find the value", "solve", "how many", "how much",
                     "what is the value", "determine the", "evaluate the expression")
     definition_kw = ("define ", "what do you mean by", "what is meant by", "give the definition")
@@ -55,16 +96,12 @@ def _infer_type(question: str) -> str:
     for kw in explain_kw:
         if q.startswith(kw) or kw in q[:40]:
             return "explain"
-
     return "factual"
 
 
-def extract_questions(text: str) -> list[dict]:
-    """
-    Use LLM to extract and classify every question from assignment text.
-    Types: factual | essay | explain | numerical | definition
-    Falls back to rule-based _infer_type if LLM doesn't follow format.
-    """
+# ── Question extraction ───────────────────────────────────────────────────────
+
+def extract_questions(text: str) -> list:
     prompt = f"""You are analyzing a student assignment. Extract every question from the text below.
 
 For each question:
@@ -101,29 +138,21 @@ Extract all questions:"""
         qtype = qtype.lower().strip()
         if qtype not in ("factual", "essay", "explain", "numerical", "definition"):
             qtype = _infer_type(question)
-        questions.append({
-            "number": int(num),
-            "question": question.strip(),
-            "type": qtype
-        })
+        questions.append({"number": int(num), "question": question.strip(), "type": qtype})
 
-    # Fallback: parse manually and infer types with rules
     if not questions:
         lines = re.split(r'\n(?=\d+[\.\)])', text.strip())
         for i, line in enumerate(lines, 1):
             clean = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
             if len(clean) > 10:
-                questions.append({
-                    "number": i,
-                    "question": clean,
-                    "type": _infer_type(clean)
-                })
+                questions.append({"number": i, "question": clean, "type": _infer_type(clean)})
 
     return questions
 
 
-def get_search_topics(questions: list[dict]) -> list[dict]:
-    """Generate 1-3 precise academic search topics per question."""
+# ── Topic generation ──────────────────────────────────────────────────────────
+
+def get_search_topics(questions: list) -> list:
     q_text = "\n".join(f"{q['number']}. {q['question']}" for q in questions)
 
     prompt = f"""For each assignment question below, suggest 1-3 specific academic search topics.
@@ -160,12 +189,9 @@ Topics:"""
     return questions
 
 
+# ── Relevance scoring ─────────────────────────────────────────────────────────
+
 def _score_paper_relevance(paper: dict, question: str, topics: list) -> float:
-    """
-    Score how relevant a paper actually is to the question.
-    Returns 0.0 to 1.0 based on how many key terms appear in title/summary.
-    """
-    import re
     title = paper.get('title', '').lower()
     summary = paper.get('summary', '').lower()
     combined = title + " " + summary
@@ -193,24 +219,15 @@ def _score_paper_relevance(paper: dict, question: str, topics: list) -> float:
     return matches / len(tokens)
 
 
-def _filter_relevant_papers(papers: list, question: str, topics: list,
-                              min_score: float = 0.15):
-    """
-    Filter out papers that don't match the question.
-    Returns (relevant_papers, scores).
-    Falls back to top 2 if nothing passes threshold.
-    """
+def _filter_relevant_papers(papers: list, question: str, topics: list, min_score: float = 0.15):
     scored = sorted(
         [(_score_paper_relevance(p, question, topics), p) for p in papers],
         key=lambda x: x[0], reverse=True
     )
-
     for score, p in scored:
         print(f"[assignment] relevance={score:.2f} | {p.get('title', '')[:60]}")
 
     relevant = [(s, p) for s, p in scored if s >= min_score]
-
-    # Nothing passes — use top 2 to avoid empty answer
     if not relevant:
         relevant = scored[:2]
 
@@ -218,12 +235,6 @@ def _filter_relevant_papers(papers: list, question: str, topics: list,
 
 
 def _compute_confidence(papers: list, scores: list) -> str:
-    """
-    Confidence based on BOTH count AND relevance scores — not just count.
-    High  = 3+ papers, avg relevance > 0.3
-    Medium = 2+ papers, avg relevance > 0.15
-    Low   = papers found but weak relevance
-    """
     if not papers or not scores:
         return "⚪ No papers"
     avg = sum(scores) / len(scores)
@@ -235,8 +246,73 @@ def _compute_confidence(papers: list, scores: list) -> str:
         return "🔴 Low"
 
 
+# ── Paper gathering ───────────────────────────────────────────────────────────
+
+def _gather_relevant_papers(question: str, topics: list, min_relevant: int = 2) -> list:
+    from search_engine import search as engine_search
+    from crawler_worker import index_topic
+
+    all_candidates = {}
+
+    for topic in topics:
+        results, _ = engine_search(topic, limit=8)
+        for r in results:
+            all_candidates[r['pdf']] = r
+
+    results, _ = engine_search(question, limit=8)
+    for r in results:
+        all_candidates[r['pdf']] = r
+
+    candidates = list(all_candidates.values())
+    print(f"[assignment] {len(candidates)} candidates before relevance filter")
+
+    scored = sorted(
+        [(_score_paper_relevance(p, question, topics), p) for p in candidates],
+        key=lambda x: x[0], reverse=True
+    )
+
+    for score, p in scored[:6]:
+        print(f"[assignment]   {score:.2f} | {p.get('title', '')[:60]}")
+
+    good = [(s, p) for s, p in scored if s >= 0.2]
+
+    if len(good) >= min_relevant:
+        return [p for _, p in good[:6]]
+
+    primary = topics[0] if topics else question
+    print(f"[assignment] Crawling '{primary}' for gap fill...")
+
+    try:
+        index_topic(primary)
+    except Exception as e:
+        print(f"[assignment] Crawl error: {e}")
+
+    deadline = time.time() + CRAWL_WAIT_TIMEOUT
+    while time.time() < deadline:
+        new_results, _ = engine_search(primary, limit=10)
+        for r in new_results:
+            all_candidates[r['pdf']] = r
+
+        scored = sorted(
+            [(_score_paper_relevance(p, question, topics), p)
+             for p in all_candidates.values()],
+            key=lambda x: x[0], reverse=True
+        )
+        good = [(s, p) for s, p in scored if s >= 0.2]
+
+        if len(good) >= min_relevant:
+            print(f"[assignment] Gap filled — {len(good)} relevant papers")
+            return [p for _, p in good[:6]]
+
+        time.sleep(CRAWL_POLL_INTERVAL)
+
+    print(f"[assignment] Timeout — using top {min(3, len(scored))} by score")
+    return [p for _, p in scored[:3]]
+
+
+# ── Answer generation ─────────────────────────────────────────────────────────
+
 def generate_answer(question: dict, papers: list) -> dict:
-    """Generate a research-backed answer. Prompt varies by question type."""
     q_type = question.get('type', 'factual')
     topics = question.get('topics', [])
 
@@ -269,13 +345,9 @@ def generate_answer(question: dict, papers: list) -> dict:
             "papers_found": 0
         }
 
-    # Filter irrelevant papers BEFORE sending to LLM
-    relevant_papers, scores = _filter_relevant_papers(
-        papers, question['question'], topics
-    )
+    relevant_papers, scores = _filter_relevant_papers(papers, question['question'], topics)
     confidence_label = _compute_confidence(relevant_papers, scores)
 
-    # Build context using titles (not "Paper 1", "Paper 2")
     context_parts = []
     sources_used = []
 
@@ -289,16 +361,15 @@ def generate_answer(question: dict, papers: list) -> dict:
 
     context = "\n\n".join(context_parts)
 
-    # Shared citation rule injected into every prompt
     cite_rule = (
-        'IMPORTANT: When citing a paper, use its exact title in quotes — '
+        'IMPORTANT: Cite papers by their exact title in quotes — '
         'e.g. "According to \\"Mitochondria and Cellular Respiration\\"..."\n'
         'NEVER say "Paper 1", "Paper 2", or refer to papers by number.\n'
         'NEVER invent information not found in the papers provided.\n'
     )
 
     if q_type == 'essay':
-        prompt = f"""Write an essay answer to the question below using ONLY the research papers provided.
+        prompt = f"""Write an essay answer using ONLY the research papers provided.
 
 {cite_rule}
 Structure:
@@ -314,7 +385,7 @@ Research papers:
 Essay answer:"""
 
     elif q_type == 'explain':
-        prompt = f"""Explain the following clearly using ONLY the research papers provided.
+        prompt = f"""Explain clearly using ONLY the research papers provided.
 Cover the mechanism or process step by step. Keep under 120 words.
 
 {cite_rule}
@@ -327,8 +398,8 @@ Research papers:
 Explanation:"""
 
     elif q_type == 'definition':
-        prompt = f"""Define the following precisely using the research papers provided.
-Keep under 60 words. Include the field and significance.
+        prompt = f"""Define precisely using the research papers provided.
+Keep under 60 words. Include field and significance.
 
 {cite_rule}
 
@@ -340,7 +411,7 @@ Research papers:
 Definition:"""
 
     else:  # factual
-        prompt = f"""Answer the question directly and concisely using ONLY the research papers provided.
+        prompt = f"""Answer directly and concisely using ONLY the research papers provided.
 Keep under 80 words.
 
 {cite_rule}
@@ -365,114 +436,26 @@ Answer:"""
     }
 
 
-def _gather_relevant_papers(question: str, topics: list, min_relevant: int = 2) -> list:
-    """
-    Multi-strategy paper gathering for a single question.
-
-    Strategy:
-    1. Search each topic individually
-    2. Also search the question itself directly (catches cases where topics are too narrow)
-    3. Score ALL candidates by relevance to the question
-    4. If top results still score poorly, crawl the best topic and retry once
-    5. Return top N by relevance score — never by count alone
-    """
-    from search_engine import search as engine_search
-    from crawler_worker import index_topic
-
-    all_candidates = {}  # pdf → paper, deduplicated
-
-    # Search each topic
-    for topic in topics:
-        results, _ = engine_search(topic, limit=8)
-        for r in results:
-            all_candidates[r['pdf']] = r
-
-    # Also search the raw question — often more specific than generated topics
-    results, _ = engine_search(question, limit=8)
-    for r in results:
-        all_candidates[r['pdf']] = r
-
-    candidates = list(all_candidates.values())
-    print(f"[assignment] {len(candidates)} candidates before relevance filter")
-
-    # Score all candidates against the question
-    scored = sorted(
-        [(_score_paper_relevance(p, question, topics), p) for p in candidates],
-        key=lambda x: x[0], reverse=True
-    )
-
-    for score, p in scored[:8]:
-        print(f"[assignment]   {score:.2f} | {p.get('title', '')[:65]}")
-
-    # Papers that actually match
-    good = [(s, p) for s, p in scored if s >= 0.2]
-
-    if len(good) >= min_relevant:
-        return [p for _, p in good[:6]]
-
-    # Not enough good papers — crawl the primary topic and wait
-    primary_topic = topics[0] if topics else question
-    print(f"[assignment] Only {len(good)} relevant papers. Crawling '{primary_topic}'...")
-
-    try:
-        index_topic(primary_topic)
-    except Exception as e:
-        print(f"[assignment] Crawl error: {e}")
-
-    # Retry search after crawl
-    deadline = time.time() + CRAWL_WAIT_TIMEOUT
-    while time.time() < deadline:
-        new_results, _ = engine_search(primary_topic, limit=10)
-        for r in new_results:
-            all_candidates[r['pdf']] = r
-
-        # Re-score everything including new papers
-        scored = sorted(
-            [(_score_paper_relevance(p, question, topics), p)
-             for p in all_candidates.values()],
-            key=lambda x: x[0], reverse=True
-        )
-        good = [(s, p) for s, p in scored if s >= 0.2]
-
-        if len(good) >= min_relevant:
-            print(f"[assignment] Crawl improved results — {len(good)} relevant papers now")
-            return [p for _, p in good[:6]]
-
-        print(f"[assignment] Still waiting... ({len(good)} relevant so far)")
-        time.sleep(CRAWL_POLL_INTERVAL)
-
-    # Timeout — return whatever scored best, even if relevance is low
-    print(f"[assignment] Timeout — returning top {min(3, len(scored))} by score")
-    return [p for _, p in scored[:3]]
-
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 def analyze_assignment(text: str, mode: str = "topics") -> dict:
     """
-    Main entry point.
-
     mode = "topics"  → extract + classify questions + suggest topics (fast, ~20s)
-    mode = "answers" → full pipeline: search with relevance filtering,
-                       crawl if needed, generate answers (2-5 min)
+    mode = "answers" → full pipeline: search, crawl if needed, generate answers
     """
     questions = extract_questions(text)
 
     if not questions:
         return {
             "error": "Could not find any questions in the text. Make sure questions are clearly numbered or separated.",
-            "questions": [],
-            "total": 0
+            "questions": [], "total": 0
         }
 
     questions = get_search_topics(questions)
 
     if mode == "topics":
-        return {
-            "questions": questions,
-            "mode": "topics",
-            "total": len(questions),
-        }
+        return {"questions": questions, "mode": "topics", "total": len(questions)}
 
-    # Answers mode — gather relevant papers per question, then generate answers
     for q in questions:
         print(f"\n[assignment] === Q{q['number']}: {q['question'][:60]} ===")
         q['papers'] = _gather_relevant_papers(
@@ -486,8 +469,4 @@ def analyze_assignment(text: str, mode: str = "topics") -> dict:
         result = generate_answer(q, q.get('papers', []))
         q.update(result)
 
-    return {
-        "questions": questions,
-        "mode": "answers",
-        "total": len(questions),
-    }
+    return {"questions": questions, "mode": "answers", "total": len(questions)}
