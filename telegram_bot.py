@@ -20,7 +20,8 @@ from users import (
     add_to_history, get_history,
     get_digest_time, set_digest_time, now_utc
 )
-from llm_summarizer import summarize_text
+from llm_summarizer import summarize_text, ask_paper as _ask_paper_fn, compare_papers as _compare_papers_fn
+from users import get_education_level, set_education_level, EDUCATION_LEVELS
 from assignment_analyzer import analyze_assignment
 
 from features.saved_papers import save_paper, unsave_paper, get_saved_papers, add_note
@@ -97,25 +98,67 @@ def build_page(query: str, results: list, page: int):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_username = os.getenv("ADMIN_USERNAME", "@admin")
+    user_name = update.effective_user.first_name or "there"
+
+    # ── Message 1: Intro ──────────────────────────────────────
     await update.message.reply_text(
-        "📚 Study Engine Bot\n\n"
-        "Find academic papers instantly.\n\n"
-        "Commands:\n"
-        "/study <topic> — search papers\n"
-        "/save <link> — save a paper\n"
-        "/saved — view saved papers\n"
-        "/history — recent searches\n"
-        "/summarize <link> — AI summary (premium)\n"
-        "/ask <link> <question> — ask a paper (premium)\n"
-        "/compare <l1> <l2> — compare papers (premium)\n"
-        "/assignment — analyze your assignment (premium)\n"
-        "/export — export saves as PDF (premium)\n"
-        "/collections — manage collections (premium)\n"
-        "/setalert <topic> — new paper alerts (premium)\n"
-        "/digest [HH:MM] — daily digest (premium)\n"
-        "/premium — upgrade\n\n"
-        f"Need help? Contact {admin_username}"
+        f"Hey {user_name} 👋\n\n"
+        "I'm *Study Atlas* — your academic research assistant.\n\n"
+        "I search millions of papers from ArXiv, PubMed, and Semantic Scholar, "
+        "summarize them in plain English, and help you understand them — "
+        "so you spend less time hunting for sources and more time actually studying.\n\n"
+        "Free to start. No sign-up needed.",
+        parse_mode="Markdown"
     )
+
+    # ── Message 2: Assignment Analyzer (flagship feature) ─────
+    await update.message.reply_text(
+        "🧠 *New — Assignment Analyzer*\n\n"
+        "Send me your assignment and I'll:\n"
+        "• Break it into individual questions\n"
+        "• Find relevant research papers for each one\n"
+        "• Generate research-backed answers with citations\n\n"
+        "Supports PDF uploads or plain text paste.\n\n"
+        "Try it: /assignment",
+        parse_mode="Markdown"
+    )
+
+    # ── Message 3: Core search ────────────────────────────────
+    await update.message.reply_text(
+        "🔍 *Search & Read Papers*\n\n"
+        "/study <topic> — find papers on any topic\n"
+        "/summarize <link> — get a plain English summary ✨\n"
+        "/ask <link> <question> — ask anything about a paper ✨\n"
+        "/compare <link1> <link2> — compare two papers side by side ✨\n\n"
+        "✨ Premium feature",
+        parse_mode="Markdown"
+    )
+
+    # ── Message 4: Organisation features ─────────────────────
+    await update.message.reply_text(
+        "📂 *Stay Organised*\n\n"
+        "/save <link> — save a paper to your library\n"
+        "/saved — view your saved papers\n"
+        "/collections — group papers into collections ✨\n"
+        "/export — export your library as PDF ✨\n"
+        "/history — your recent searches",
+        "/setlevel — set your education level (affects answer depth & style)",
+        parse_mode="Markdown"
+    )
+
+    # ── Message 5: Alerts + digest (grouped as minor features)
+    await update.message.reply_text(
+        "🔔 *Stay Updated*\n\n"
+        "/setalert <topic> — get notified when new papers drop ✨\n"
+        "/digest — daily research digest delivered every morning ✨\n\n"
+        "✨ Premium feature\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "💎 Upgrade for full access: /premium\n"
+        f"❓ Need help: {admin_username}",
+        parse_mode="Markdown"
+    )
+
+
 
 
 # ── /study ────────────────────────────────────────────────────
@@ -437,14 +480,18 @@ async def summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Paper not found. Search first: /study <topic>")
         return
 
-    summary = doc.get("ai_summary")
+    level = get_education_level(user_id)
+    level_key = level["short"].lower().replace("/", "_").replace(" ", "_")
+    cache_field = f"ai_summary_{level_key}"
+
+    summary = doc.get(cache_field)
     if not summary:
-        await update.message.reply_text("Generating summary...")
-        summary = summarize_text(doc.get("summary", ""))
-        resources.update_one({"_id": doc["_id"]}, {"$set": {"ai_summary": summary}})
+        await update.message.reply_text(f"Generating summary [{level['short']}]...")
+        summary = summarize_text(doc.get("summary", ""), level=level)
+        resources.update_one({"_id": doc["_id"]}, {"$set": {cache_field: summary}})
         increment_summary_usage(user_id)
 
-    await update.message.reply_text(f"Summary\n\n{summary}")
+    await update.message.reply_text(f"📄 Summary [{level['short']}]\n\n{summary}")
 
     related_query = doc.get("topic") or doc.get("title", "")
     related = search_related(related_query, current_pdf=doc["pdf"], limit=4)
@@ -475,7 +522,8 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Paper not found. Search first: /study <topic>")
         return
     await update.message.reply_text("Thinking...")
-    answer = ask_paper(doc.get("summary", ""), question, doc.get("title", ""))
+    level = get_education_level(user_id)
+    answer = _ask_paper_fn(doc.get("summary", ""), question, doc.get("title", ""), level=level)
     await update.message.reply_text(f"Answer\n\n{answer}")
 
 
@@ -503,7 +551,8 @@ async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("Comparing papers...")
-    result = compare_papers(papers)
+    level = get_education_level(user_id)
+    result = _compare_papers_fn(papers, level=level)
     await update.message.reply_text(f"Comparison\n\n{result}")
 
 
@@ -569,6 +618,41 @@ async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Daily Digest\nCurrent time: {current} UTC\n\n"
             "Change with /digest HH:MM\n"
             "Digest sends new papers for your /setalert topics."
+        )
+
+
+# ── /setlevel ─────────────────────────────────────────────────
+
+async def setlevel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # No argument — show current level + options
+    if not context.args:
+        current = get_education_level(user_id)
+        lines = [
+            f"🎓 Your current level: *{current['label']}*\n",
+            "This affects how answers, summaries, and comparisons are written.\n",
+            "Choose your level:\n"
+        ]
+        for key, lvl in EDUCATION_LEVELS.items():
+            lines.append(f"/setlevel {key} — {lvl['label']}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    level_key = context.args[0].lower().strip()
+    if set_education_level(user_id, level_key):
+        lvl = EDUCATION_LEVELS[level_key]
+        await update.message.reply_text(
+            f"✅ Level set to *{lvl['label']}*\n\n"
+            f"All future answers, summaries, and assignment analysis "
+            f"will be written at *{lvl['short']}* level.",
+            parse_mode="Markdown"
+        )
+    else:
+        valid = ", ".join(EDUCATION_LEVELS.keys())
+        await update.message.reply_text(
+            f"❌ Unknown level `{level_key}`.\n\nValid options: {valid}",
+            parse_mode="Markdown"
         )
 
 
@@ -742,8 +826,8 @@ async def assignment_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📚 Topics only", callback_data="assign:topics"),
-            InlineKeyboardButton("✍️ Full answers", callback_data="assign:answers")
+            InlineKeyboardButton("📚 Topics only", callback_data="assign:mode:topics"),
+            InlineKeyboardButton("✍️ Full answers", callback_data="assign:mode:answers")
         ],
         [InlineKeyboardButton("❌ Cancel", callback_data="assign:cancel")]
     ])
@@ -762,19 +846,22 @@ async def assignment_mode_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
 
     user_id = query.from_user.id
-    action = query.data.split(":")[1]
+    # data format: "assign:cancel" or "assign:mode:topics" or "assign:mode:answers"
+    parts = query.data.split(":")
+    action = parts[1]  # "cancel" or "mode"
 
     if action == "cancel":
         assignment_sessions.pop(user_id, None)
         await query.edit_message_text("❌ Assignment analysis cancelled.")
         return
 
+    mode = parts[2] if len(parts) > 2 else "topics"  # "topics" or "answers"
+
     session = assignment_sessions.get(user_id)
     if not session or "text" not in session:
         await query.edit_message_text("⚠️ Session expired. Please use /assignment again.")
         return
 
-    mode = action   # "topics" or "answers"
     assignment_text = session["text"]
     assignment_sessions.pop(user_id, None)
 
@@ -794,7 +881,8 @@ async def assignment_mode_callback(update: Update, context: ContextTypes.DEFAULT
     try:
         result = await loop.run_in_executor(
             None,
-            lambda: analyze_assignment(assignment_text, mode=mode)
+            lambda: analyze_assignment(assignment_text, mode=mode,
+                                         level=get_education_level(query.from_user.id))
         )
     except Exception as e:
         print(f"[assignment] Analysis error: {e}")
@@ -818,6 +906,58 @@ async def assignment_mode_callback(update: Update, context: ContextTypes.DEFAULT
         await _send_topic_map(context.bot, query.message.chat_id, questions, total)
     else:
         await _send_answers(context.bot, query.message.chat_id, questions, total)
+
+
+async def assignment_regen_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle 'Regenerate' button — force fresh LLM answer, skip KB."""
+    query = update.callback_query
+    await query.answer("🔄 Regenerating with fresh search...")
+
+    regen_id = query.data.split(":", 2)[2]
+    bot = context.bot
+
+    # Retrieve stored question data
+    store = getattr(bot, '_regen_store', {})
+    data = store.get(regen_id)
+    if not data:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await bot.send_message(
+            chat_id=query.message.chat_id,
+            text="⚠️ Regenerate session expired. Please use /assignment again."
+        )
+        return
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    await bot.send_message(
+        chat_id=data['chat_id'],
+        text=f"🔄 Regenerating answer for Q{data['number']}...\nSearching papers now."
+    )
+
+    loop = asyncio.get_event_loop()
+
+    def run_regen():
+        from assignment_analyzer import _gather_relevant_papers, generate_answer
+        q = {
+            "number": data['number'],
+            "question": data['question'],
+            "type": data['type'],
+            "topics": data.get('topics', [])
+        }
+        q['papers'] = _gather_relevant_papers(q['question'], q['topics'])
+        return generate_answer(q, q['papers'], force_regenerate=True)
+
+    try:
+        result = await loop.run_in_executor(None, run_regen)
+        await _send_answers(bot, data['chat_id'], [result], 1)
+    except Exception as e:
+        print(f"[assignment] Regen error: {e}")
+        await bot.send_message(
+            chat_id=data['chat_id'],
+            text="⚠️ Regeneration failed. Please try /assignment again."
+        )
+
+    # Clean up store
+    store.pop(regen_id, None)
 
 
 async def _send_topic_map(bot, chat_id: int, questions: list, total: int):
@@ -852,14 +992,18 @@ async def _send_answers(bot, chat_id: int, questions: list, total: int):
         text=f"📋 Assignment Analysis — {total} question(s)\nGenerating answers from academic research..."
     )
 
-    type_emoji = {"factual": "🔬", "essay": "✍️", "numerical": "🔢", "definition": "📖"}
+    type_emoji = {"factual": "🔬", "essay": "✍️", "numerical": "🔢", "definition": "📖", "explain": "💡"}
 
     for q in questions:
-        emoji = type_emoji.get(q["type"], "❓")
+        emoji = type_emoji.get(q.get("type", ""), "❓")
         confidence = q.get("confidence_label", "")
         papers_found = q.get("papers_found", 0)
         answer = q.get("answer", "No answer generated.")
         sources = q.get("sources", [])
+        from_kb = q.get("from_kb", False)
+
+        # KB answers get a subtle badge so user knows it's from stored results
+        kb_badge = "⚡ Instant answer  |  " if from_kb else ""
 
         msg = (
             f"{emoji} Q{q['number']} — {q['type']}\n"
@@ -874,13 +1018,47 @@ async def _send_answers(bot, chat_id: int, questions: list, total: int):
                 msg += f"• {title_short}\n  {s['link']}\n"
 
         if confidence:
-            msg += f"\nConfidence: {confidence} ({papers_found} papers found)"
+            msg += f"\n{kb_badge}Confidence: {confidence}"
+            if papers_found:
+                msg += f" ({papers_found} papers)"
 
         if len(msg) > 4000:
             msg = msg[:3950] + "\n\n(Answer truncated)"
 
+        # Show Regenerate button only for KB answers
+        keyboard = None
+        if from_kb:
+            import json
+            regen_data = json.dumps({
+                "q": q['question'],
+                "t": q.get('type', 'factual'),
+                "topics": q.get('topics', [])
+            })
+            # Store regen data in bot's user_data keyed by a short id
+            regen_id = f"{chat_id}_{q['number']}"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🔄 Not satisfied? Regenerate with fresh search",
+                    callback_data=f"assign:regen:{regen_id}"
+                )
+            ]])
+            # Store the question data so callback can retrieve it
+            if not hasattr(bot, '_regen_store'):
+                bot._regen_store = {}
+            bot._regen_store[regen_id] = {
+                "question": q['question'],
+                "type": q.get('type', 'factual'),
+                "topics": q.get('topics', []),
+                "number": q['number'],
+                "chat_id": chat_id
+            }
+
         try:
-            await bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True)
+            await bot.send_message(
+                chat_id=chat_id, text=msg,
+                disable_web_page_preview=True,
+                reply_markup=keyboard
+            )
         except Exception as e:
             print(f"[assignment] Send error Q{q['number']}: {e}")
             await bot.send_message(chat_id=chat_id, text=f"Q{q['number']}: {answer[:1000]}")
@@ -924,14 +1102,15 @@ def run_bot():
         ("newcollection", new_collection), ("delcollection", del_collection),
         ("summarize", summarize), ("ask", ask), ("compare", compare),
         ("setalert", setalert), ("removealert", removealert), ("alerts", myalerts),
-        ("digest", digest), ("premium", premium), ("givepremium", givepremium),
+        ("digest", digest), ("setlevel", setlevel), ("premium", premium), ("givepremium", givepremium),
         ("assignment", assignment),
     ]
     for name, handler in handlers:
         app.add_handler(CommandHandler(name, handler))
 
     app.add_handler(CallbackQueryHandler(page_callback, pattern="^page:"))
-    app.add_handler(CallbackQueryHandler(assignment_mode_callback, pattern="^assign:"))
+    app.add_handler(CallbackQueryHandler(assignment_mode_callback, pattern="^assign:mode:|^assign:cancel"))
+    app.add_handler(CallbackQueryHandler(assignment_regen_callback, pattern="^assign:regen:"))
 
     # Catches text and documents ONLY when user is in assignment flow
     # filters.COMMAND excluded so /study, /save etc are never intercepted

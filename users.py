@@ -160,3 +160,81 @@ def set_digest_time(user_id: int, time_str: str):
         {"user_id": user_id},
         {"$set": {"digest_time": time_str}}
     )
+
+
+# ── Education level ───────────────────────────────────────────
+
+EDUCATION_LEVELS = {
+    "highschool": {
+        "label": "🏫 High School / A-Level",
+        "short": "High School",
+        "answer_style": (
+            "Use simple plain English. Avoid technical jargon — if you must use a term, explain it in brackets. "
+            "Use analogies where helpful. Keep sentences short. "
+            "This is for a high school student who is new to the topic."
+        ),
+        "summary_style": "Explain like the reader is 16 years old with no prior knowledge of this field.",
+        "depth": "basic overview only — key concepts and definitions",
+        "search_suffix": "introduction overview basics"
+    },
+    "undergraduate": {
+        "label": "📘 Undergraduate (BSc/BTech/MBBS)",
+        "short": "Undergraduate",
+        "answer_style": (
+            "Use standard academic language. Define specialised terms on first use. "
+            "Assume the reader knows fundamentals but not advanced topics. "
+            "This is for an undergraduate student."
+        ),
+        "summary_style": "Explain clearly for an undergraduate student familiar with the basics of the field.",
+        "depth": "core concepts with key mechanisms and evidence",
+        "search_suffix": ""  # no suffix — default behaviour
+    },
+    "postgraduate": {
+        "label": "🎓 Postgraduate (MSc/MBA/MD)",
+        "short": "Postgraduate",
+        "answer_style": (
+            "Use full academic terminology. Assume solid domain knowledge. "
+            "Include methodological detail, limitations, and competing perspectives where relevant. "
+            "This is for a postgraduate student."
+        ),
+        "summary_style": "Summarise for a postgraduate researcher. Include methodology, key findings, and limitations.",
+        "depth": "comprehensive — mechanisms, evidence, limitations, current debates",
+        "search_suffix": "advanced mechanisms"
+    },
+    "phd": {
+        "label": "🔬 PhD / Research",
+        "short": "PhD/Research",
+        "answer_style": (
+            "Use precise technical language and field-specific terminology freely. "
+            "Address current research gaps, conflicting findings, and methodological nuances. "
+            "Cite specific papers and findings. This is for an active researcher."
+        ),
+        "summary_style": (
+            "Summarise for an expert researcher. Focus on novelty, methodology, statistical approach, "
+            "limitations, and how this advances the field."
+        ),
+        "depth": "expert level — current research front, open questions, methodological critique",
+        "search_suffix": "research review systematic"
+    }
+}
+
+DEFAULT_LEVEL = "undergraduate"
+
+
+def get_education_level(user_id: int) -> dict:
+    """Returns the full level config dict for this user. Defaults to undergraduate."""
+    u = _get_or_create_user(user_id)
+    level_key = u.get("education_level", DEFAULT_LEVEL)
+    return EDUCATION_LEVELS.get(level_key, EDUCATION_LEVELS[DEFAULT_LEVEL])
+
+
+def set_education_level(user_id: int, level_key: str) -> bool:
+    """Set user's education level. Returns False if level_key is invalid."""
+    if level_key not in EDUCATION_LEVELS:
+        return False
+    _get_or_create_user(user_id)
+    users.update_one(
+        {"user_id": user_id},
+        {"$set": {"education_level": level_key}}
+    )
+    return True

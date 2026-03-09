@@ -68,6 +68,16 @@ def ensure_indexes():
     digest_log.create_index([("user_id", 1), ("date", 1)], unique=True)
     digest_log.create_index("sent_at", expireAfterSeconds=604800)
 
+    # ── assignment answers knowledge base ──────────────────────
+    # Stores LLM-generated answers with embeddings for semantic search.
+    # Future users with similar questions get stored answers instantly.
+    # Requires MongoDB Atlas vector index named "assignment_vector_index"
+    # on "embedding" field (768 dims, cosine similarity).
+    assignment_answers = db["assignment_answers"]
+    assignment_answers.create_index("question_hash", unique=True)
+    assignment_answers.create_index("topic")
+    assignment_answers.create_index("created_at")
+
     print("[db] All indexes ready.")
 
 
