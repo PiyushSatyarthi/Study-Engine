@@ -1,6 +1,7 @@
 from db import resources
 from embeddings import embed, embed_query
 from functools import lru_cache
+from datetime import datetime, timezone
 from constants import STOPWORDS
 import re
 
@@ -35,7 +36,7 @@ def vector_search(query: str, limit: int = 40):
                     "index": "vector_index",
                     "path": "embedding",
                     "queryVector": list(query_vector),
-                    "numCandidates": 120,
+                    "numCandidates": 200,
                     "limit": limit
                 }
             },
@@ -110,6 +111,16 @@ def hybrid_rank(vector_results, keyword_results, limit: int = 20):
         boost = DOMAIN_BOOST.get(r.get("source", "").lower(), 1.0)
         scores[key] = scores[key] * boost
 
+    # Mild recency boost: papers indexed in last 30 days get up to 10% boost
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for key, r in combined.items():
+        indexed_at = r.get("indexed_at")
+        if indexed_at:
+            age_days = (now - indexed_at).days
+            if age_days < 30:
+                recency_boost = 1.0 + 0.1 * (1.0 - age_days / 30.0)
+                scores[key] = scores[key] * recency_boost
+
     ranked = sorted(
         combined.values(),
         key=lambda r: scores.get(r["pdf"], 0),
@@ -122,7 +133,7 @@ def score_result(r: dict, tokens: list[str]) -> float:
     """
     Score a single result against query tokens.
     Uses word-boundary matching to avoid 'metabolic' matching 'meta'.
-    Weighs title matches more than summary matches.
+    Title and summary matches are additive — papers matching in both score higher.
     """
     title = r.get("title", "").lower()
     summary = r.get("summary", "").lower()
@@ -131,36 +142,33 @@ def score_result(r: dict, tokens: list[str]) -> float:
     summary_score = 0.0
 
     for token in tokens:
-        # Check full word match (e.g. 'gut' shouldn't match 'gutsiest')
-        # Simple approach: check token surrounded by non-alpha or at string boundaries
         pattern = r'(?<![a-z])' + re.escape(token) + r'(?![a-z])'
         if re.search(pattern, title):
-            title_score += 1.0        # title match worth full point
-        elif re.search(pattern, summary):
-            summary_score += 0.6      # summary match worth 0.6
+            title_score += 1.0
+        if re.search(pattern, summary):
+            summary_score += 0.4
 
     total = title_score + summary_score
-    return total / len(tokens)
+    max_possible = len(tokens) * 1.4      # max per token = 1.0 + 0.4
+    return total / max_possible
 
 
 def dynamic_threshold(tokens: list[str]) -> float:
     """
     Stricter threshold for longer queries, but capped so very long
     queries don't become impossible to satisfy.
-    - 1 token:  0.3
-    - 2 tokens: 0.4
-    - 3 tokens: 0.5
-    - 4+ tokens: 0.55 (capped — long queries have diminishing returns)
+    Thresholds are calibrated for score_result's [0, 1] range where
+    title match = 1.0/1.4 ≈ 0.71 and summary-only = 0.4/1.4 ≈ 0.29 per token.
     """
     n = len(tokens)
     if n <= 1:
-        return 0.3
+        return 0.25
     elif n == 2:
-        return 0.4
+        return 0.35
     elif n == 3:
-        return 0.5
+        return 0.4
     else:
-        return 0.55  # capped: 4+ token queries shouldn't need 60%+ match
+        return 0.45  # capped: 4+ token queries shouldn't need 50%+ match
 
 
 def relevance_filter(results, query: str):
@@ -202,7 +210,7 @@ def relevance_filter(results, query: str):
         return [], True
 
     top_score = scored[0][0]
-    low_relevance = top_score < 0.5
+    low_relevance = top_score < 0.4
     low_count = len(filtered) < MIN_RESULTS_THRESHOLD
     needs_crawl = low_relevance and low_count
 
@@ -266,10 +274,10 @@ def search(query: str, limit: int = 20):
     """
     print(f"[search] Query: '{query}'")
 
-    total_docs = resources.count_documents({})
-    print(f"[search] Total docs in DB: {total_docs}")
+    is_empty = resources.find_one({}, {"_id": 1}) is None
+    print(f"[search] DB empty: {is_empty}")
 
-    if total_docs == 0:
+    if is_empty:
         print("[search] DB empty — crawler hasn't run yet")
         return [], True
 

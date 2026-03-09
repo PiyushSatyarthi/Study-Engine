@@ -8,7 +8,7 @@ def search_semantic_scholar(query, max_results=20):
     params = {
         "query": query,
         "limit": max_results,
-        "fields": "title,abstract,url"
+        "fields": "title,abstract,url,year,citationCount"
     }
 
     try:
@@ -30,7 +30,9 @@ def search_semantic_scholar(query, max_results=20):
             "summary": summary,
             "pdf": url,
             "type": "paper",
-            "source": "semantic_scholar"
+            "source": "semantic_scholar",
+            "year": paper.get("year"),
+            "citation_count": paper.get("citationCount", 0)
         })
 
     return results

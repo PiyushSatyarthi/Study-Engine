@@ -50,9 +50,12 @@ def search_doab(query, max_results=20):
         if not pdf_link:
             continue
 
+        description = (book.get("description", "")
+                       or book.get("abstract", "")
+                       or "")
         results.append({
             "title": title,
-            "summary": title,
+            "summary": description if len(description) > 40 else title,
             "pdf": pdf_link,
             "type": "book",
             "source": "doab"

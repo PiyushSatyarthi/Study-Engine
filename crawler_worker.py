@@ -113,6 +113,12 @@ def index_topic(topic):
             "indexed_at": datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
         }
 
+        # Optional metadata from crawlers that provide it
+        if r.get("year"):
+            doc["year"] = r["year"]
+        if r.get("citation_count"):
+            doc["citation_count"] = r["citation_count"]
+
         resources.insert_one(doc)
         added += 1
 

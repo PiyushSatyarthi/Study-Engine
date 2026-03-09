@@ -12,13 +12,12 @@ def get_suggestions(query: str, n: int = 3) -> list:
     Find related topics by looking at what's actually indexed in the DB
     for the same broad subject area. Uses the topic field on resources.
 
-    Much better than the old approach of appending 'applications' / 'deep learning'
-    to whatever the first token was.
+    Requires topics to share at least 2 meaningful tokens with the query
+    (or all tokens if query has only 1). This prevents cross-domain pollution
+    like "cell" in a physics query matching biology topics.
     """
     q = query.lower().strip()
 
-    # Pull topics from DB that share meaningful tokens with the query
-    # Exclude stopwords and the query itself
     tokens = [
         t.strip(".,;:()?!")
         for t in q.split()
@@ -29,27 +28,27 @@ def get_suggestions(query: str, n: int = 3) -> list:
     if not tokens:
         return []
 
+    # Require topics match at least 2 tokens (or all if query has only 1)
+    min_overlap = min(2, len(tokens))
+
     # Find distinct topics in DB that contain any of these tokens
-    # Use a $or regex match on the topic field
     regex_parts = [{"topic": {"$regex": t, "$options": "i"}} for t in tokens]
 
     try:
         pipeline = [
             {"$match": {"$or": regex_parts}},
             {"$group": {"_id": "$topic", "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-            {"$limit": 20}
+            {"$limit": 50}
         ]
         results = list(resources.aggregate(pipeline))
         topics = [r["_id"] for r in results if r["_id"]]
 
-        # Filter out topics that are too similar to the original query
-        # and deduplicate near-duplicates
         seen_tokens = set(tokens)
         suggestions = []
+        scored = []
+
         for t in topics:
             t_lower = t.lower()
-            # Skip if it's basically the same as the query
             if t_lower == q:
                 continue
             t_tokens = set(
@@ -59,9 +58,14 @@ def get_suggestions(query: str, n: int = 3) -> list:
             # Skip if it shares ALL tokens with query (near-duplicate)
             if t_tokens and t_tokens.issubset(seen_tokens):
                 continue
-            suggestions.append(t)
-            if len(suggestions) >= n:
-                break
+            # Count how many query tokens appear in this topic
+            overlap = sum(1 for tok in tokens if tok in t_lower)
+            if overlap >= min_overlap:
+                scored.append((overlap, t))
+
+        # Sort by overlap descending — topics sharing more tokens rank higher
+        scored.sort(key=lambda x: x[0], reverse=True)
+        suggestions = [t for _, t in scored[:n]]
 
         if suggestions:
             return suggestions

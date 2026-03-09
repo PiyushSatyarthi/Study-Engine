@@ -24,9 +24,12 @@ def search_mit_ocw(query, max_results=10):
         title = c.get("title", "")
         link = "https://ocw.mit.edu" + c.get("url", "")
 
+        description = (c.get("description", "")
+                       or c.get("short_description", "")
+                       or "")
         results.append({
             "title": title,
-            "summary": title,
+            "summary": description if len(description) > 40 else title,
             "pdf": link,
             "type": "course",
             "source": "mit_ocw"
