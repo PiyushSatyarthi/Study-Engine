@@ -1,19 +1,23 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import hmac
 import hashlib
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from db import payments, users
 
 app = FastAPI()
 
-WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 BOT_TOKEN = os.getenv("TOKEN")
 
 
 def verify_signature(body, signature):
+    if not WEBHOOK_SECRET:
+        print("[webhook] RAZORPAY_WEBHOOK_SECRET not set")
+        return False
 
     generated = hmac.new(
         WEBHOOK_SECRET.encode(),
@@ -21,7 +25,7 @@ def verify_signature(body, signature):
         hashlib.sha256
     ).hexdigest()
 
-    return generated == signature
+    return hmac.compare_digest(generated, signature or "")
 
 
 def send_telegram_message(user_id, text):
@@ -47,7 +51,7 @@ async def razorpay_webhook(request: Request):
 
     if not verify_signature(body, signature):
         print("Invalid webhook signature")
-        return {"status": "invalid signature"}
+        return JSONResponse(status_code=401, content={"status": "invalid signature"})
 
     data = await request.json()
 
@@ -73,7 +77,7 @@ async def razorpay_webhook(request: Request):
             {"$set": {"status": "paid"}}
         )
 
-        expiry = datetime.utcnow() + timedelta(days=30)
+        expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=30)
 
         users.update_one(
             {"user_id": user_id},

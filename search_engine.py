@@ -1,6 +1,8 @@
 from db import resources
-from embeddings import embed
+from embeddings import embed, embed_query
 from functools import lru_cache
+from constants import STOPWORDS
+import re
 
 VECTOR_WEIGHT = 0.7
 KEYWORD_WEIGHT = 0.5
@@ -15,21 +17,13 @@ DOMAIN_BOOST = {
     "doab": 0.85
 }
 
-# Words too generic to be useful for relevance filtering
-STOPWORDS = {
-    "a", "an", "the", "of", "in", "on", "at", "to", "for",
-    "and", "or", "is", "it", "its", "be", "by", "as", "with",
-    "study", "based", "using", "via", "from", "into", "that",
-    "this", "their", "which", "have", "has", "are", "was", "were"
-}
-
 # Only crawl for more if fewer than this many results AND relevance is also poor
 MIN_RESULTS_THRESHOLD = 5
 
 
 @lru_cache(maxsize=200)
 def get_query_embedding(query: str):
-    return embed(query)
+    return tuple(embed_query(query))
 
 
 def vector_search(query: str, limit: int = 40):
@@ -40,7 +34,7 @@ def vector_search(query: str, limit: int = 40):
                 "$vectorSearch": {
                     "index": "vector_index",
                     "path": "embedding",
-                    "queryVector": query_vector,
+                    "queryVector": list(query_vector),
                     "numCandidates": 120,
                     "limit": limit
                 }
@@ -78,7 +72,6 @@ def keyword_search(query: str, limit: int = 40):
 
 def fallback_search(query: str, limit: int = 40):
     """Regex fallback when both vector and keyword return nothing."""
-    import re
     raw = re.split(r'[\s\-]+', query.lower())
     tokens = list(dict.fromkeys(
         t.strip(".,;:()") for t in raw
@@ -140,7 +133,6 @@ def score_result(r: dict, tokens: list[str]) -> float:
     for token in tokens:
         # Check full word match (e.g. 'gut' shouldn't match 'gutsiest')
         # Simple approach: check token surrounded by non-alpha or at string boundaries
-        import re
         pattern = r'(?<![a-z])' + re.escape(token) + r'(?![a-z])'
         if re.search(pattern, title):
             title_score += 1.0        # title match worth full point
@@ -177,7 +169,6 @@ def relevance_filter(results, query: str):
     Applies a dynamic threshold based on query length.
     Returns (filtered_results, needs_crawl).
     """
-    import re
     # Split on spaces AND hyphens so "liquid-liquid" becomes ["liquid", "liquid"]
     raw_tokens = re.split(r'[\s\-]+', query.lower())
     # Deduplicate while preserving order, drop stopwords and short tokens
@@ -243,8 +234,7 @@ def search_related(query: str, current_pdf: str, limit: int = 5):
     candidates = [r for r in candidates if r.get("pdf") != current_pdf]
 
     # Get meaningful tokens from the topic query
-    import re as _re
-    raw = _re.split(r'[\s\-]+', query.lower())
+    raw = re.split(r'[\s\-]+', query.lower())
     tokens = list(dict.fromkeys(
         t.strip(".,;:()") for t in raw
         if t.strip(".,;:()") and t.strip(".,;:()") not in STOPWORDS and len(t.strip(".,;:()")) > 3
@@ -258,7 +248,7 @@ def search_related(query: str, current_pdf: str, limit: int = 5):
     for r in candidates:
         text = (r.get("title", "") + " " + r.get("summary", "")).lower()
         match = any(
-            _re.search(r'(?<![a-z])' + _re.escape(t) + r'(?![a-z])', text)
+            re.search(r'(?<![a-z])' + re.escape(t) + r'(?![a-z])', text)
             for t in tokens
         )
         if match:

@@ -1,64 +1,6 @@
-import os
-import requests
+from llm_client import call_llm
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
-
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-OLLAMA_CHAT_URL = f"{OLLAMA_HOST}/api/chat"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-
-def _call_llm(prompt: str, max_tokens: int = 200) -> str:
-    if LLM_PROVIDER == "groq":
-        return _call_groq(prompt, max_tokens)
-    return _call_ollama(prompt, max_tokens)
-
-
-def _call_ollama(prompt: str, max_tokens: int) -> str:
-    try:
-        r = requests.post(
-            OLLAMA_CHAT_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "options": {"num_predict": max_tokens, "temperature": 0.3},
-                "stream": False
-            },
-            timeout=120
-        )
-        return r.json()["message"]["content"].strip()
-    except Exception as e:
-        print(f"[summarizer] Ollama call failed: {e}")
-        return ""
-
-
-def _call_groq(prompt: str, max_tokens: int) -> str:
-    if not GROQ_API_KEY:
-        print("[summarizer] GROQ_API_KEY not set — falling back to Ollama")
-        return _call_ollama(prompt, max_tokens)
-    try:
-        r = requests.post(
-            GROQ_API_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0.3
-            },
-            timeout=30
-        )
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"[summarizer] Groq call failed: {e} — falling back to Ollama")
-        return _call_ollama(prompt, max_tokens)
+MAX_PAPERS = 3
 
 
 def summarize_text(text: str, level: dict | None = None) -> str:
@@ -83,7 +25,7 @@ Focus on: what the paper studies, what they found, and why it matters.
 Abstract:
 {text}
 """
-    result = _call_llm(prompt, max_tokens=150)
+    result = call_llm(prompt, max_tokens=150)
     return result if result else "Could not generate summary. Please try again."
 
 
@@ -98,7 +40,7 @@ def ask_paper(abstract: str, question: str, title: str = "", level: dict | None 
         style = level["answer_style"]
 
     word_limit = {
-        "highschool": 100,
+        "high school": 100,
         "undergraduate": 150,
         "postgraduate": 200,
         "phd": 250
@@ -119,7 +61,7 @@ Answer based only on what the abstract tells you.
 If the abstract doesn't contain enough to answer, say so clearly.
 Keep under {word_limit} words."""
 
-    result = _call_llm(prompt, max_tokens=word_limit * 2)
+    result = call_llm(prompt, max_tokens=word_limit * 2)
     return result if result else "Could not generate answer. Please try again."
 
 
@@ -135,7 +77,7 @@ def compare_papers(papers: list, level: dict | None = None) -> str:
         word_limit = 200
     else:
         style = level["answer_style"]
-        word_limit = {"highschool": 150, "undergraduate": 200,
+        word_limit = {"high school": 150, "undergraduate": 200,
                       "postgraduate": 280, "phd": 350}.get(
             level["short"].lower().split("/")[0].strip(), 200
         )
@@ -157,8 +99,5 @@ Cover in under {word_limit} words:
 
 Be direct and useful."""
 
-    result = _call_llm(prompt, max_tokens=word_limit * 2)
+    result = call_llm(prompt, max_tokens=word_limit * 2)
     return result if result else "Could not generate comparison. Please try again."
-
-
-MAX_PAPERS = 3

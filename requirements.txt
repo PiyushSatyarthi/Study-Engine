@@ -1,1 +1,12 @@
-reportlab
+python-telegram-bot>=20.0
+pymongo>=4.0
+python-dotenv>=1.0
+requests>=2.28
+feedparser>=6.0
+ollama>=0.1
+razorpay>=1.4
+reportlab>=4.0
+PyPDF2>=3.0
+pdfplumber>=0.9
+fastapi>=0.100
+uvicorn>=0.22

@@ -1,76 +1,11 @@
-import os
 import re
 import time
-import requests
+from llm_client import call_llm as _call_llm
 from features.assignment_kb import find_similar_answer, store_answer, format_kb_result
-
-# ── LLM config ────────────────────────────────────────────────────────────────
-# Set LLM_PROVIDER=groq in .env to use Groq instead of Ollama
-# Groq is ~50x faster and free up to 14400 req/day
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()  # "ollama" | "groq"
-
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
-OLLAMA_CHAT_URL = f"{OLLAMA_HOST}/api/chat"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Crawl settings
 CRAWL_WAIT_TIMEOUT = 120
 CRAWL_POLL_INTERVAL = 8
-
-
-# ── LLM call (Ollama or Groq) ─────────────────────────────────────────────────
-
-def _call_llm(prompt: str, max_tokens: int = 800, temperature: float = 0.3) -> str:
-    if LLM_PROVIDER == "groq":
-        return _call_groq(prompt, max_tokens, temperature)
-    return _call_ollama(prompt, max_tokens, temperature)
-
-
-def _call_ollama(prompt: str, max_tokens: int, temperature: float) -> str:
-    try:
-        r = requests.post(
-            OLLAMA_CHAT_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "options": {"num_predict": max_tokens, "temperature": temperature},
-                "stream": False
-            },
-            timeout=180
-        )
-        return r.json()["message"]["content"].strip()
-    except Exception as e:
-        print(f"[assignment] Ollama call failed: {e}")
-        return ""
-
-
-def _call_groq(prompt: str, max_tokens: int, temperature: float) -> str:
-    if not GROQ_API_KEY:
-        print("[assignment] GROQ_API_KEY not set — falling back to Ollama")
-        return _call_ollama(prompt, max_tokens, temperature)
-    try:
-        r = requests.post(
-            GROQ_API_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": temperature
-            },
-            timeout=30
-        )
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"[assignment] Groq call failed: {e} — falling back to Ollama")
-        return _call_ollama(prompt, max_tokens, temperature)
 
 
 # ── Question type inference ───────────────────────────────────────────────────

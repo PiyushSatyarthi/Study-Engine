@@ -46,38 +46,41 @@ def _get_or_create_user(user_id: int) -> dict:
     return u
 
 
-def _maybe_reset(user_id: int, count_field: str, reset_field: str):
-    now = now_utc()
-    u = users.find_one({"user_id": user_id})
-    if not u:
-        return
-    reset_time = u.get(reset_field)
-    if not reset_time or reset_time < now:
-        users.update_one(
-            {"user_id": user_id},
-            {"$set": {count_field: 0, reset_field: _midnight_tomorrow()}}
-        )
-
-
-# ── Premium ───────────────────────────────────────────────────
-
-def is_premium(user_id: int) -> bool:
-    u = users.find_one({"user_id": user_id})
+def _is_premium_from_doc(u: dict) -> bool:
+    """Check premium status from an already-fetched user document."""
     if not u:
         return False
     expiry = u.get("premium_expiry")
     return bool(expiry and expiry > now_utc())
 
 
+def _maybe_reset_from_doc(user_id: int, u: dict, count_field: str, reset_field: str):
+    """Reset counter if past reset time. Operates on an already-fetched doc."""
+    now = now_utc()
+    reset_time = u.get(reset_field)
+    if not reset_time or reset_time < now:
+        users.update_one(
+            {"user_id": user_id},
+            {"$set": {count_field: 0, reset_field: _midnight_tomorrow()}}
+        )
+        u[count_field] = 0  # update in-memory doc
+
+
+# ── Premium ───────────────────────────────────────────────────
+
+def is_premium(user_id: int) -> bool:
+    u = users.find_one({"user_id": user_id})
+    return _is_premium_from_doc(u)
+
+
 # ── Study limits ──────────────────────────────────────────────
 
 def can_use_study(user_id: int):
-    """Returns (allowed, remaining, limit)"""
-    _get_or_create_user(user_id)
-    _maybe_reset(user_id, "daily_study_count", "study_reset")
-    u = users.find_one({"user_id": user_id})
+    """Returns (allowed, remaining, limit). Single DB fetch."""
+    u = _get_or_create_user(user_id)
+    _maybe_reset_from_doc(user_id, u, "daily_study_count", "study_reset")
     count = u.get("daily_study_count", 0)
-    limit = PREMIUM_STUDY_DAILY if is_premium(user_id) else FREE_STUDY_DAILY
+    limit = PREMIUM_STUDY_DAILY if _is_premium_from_doc(u) else FREE_STUDY_DAILY
     remaining = max(0, limit - count)
     return remaining > 0, remaining, limit
 
@@ -94,11 +97,10 @@ def get_results_limit(user_id: int) -> int:
 
 def can_use_summary(user_id: int):
     """Returns (allowed, remaining). Free users always get (False, 0)."""
-    if not is_premium(user_id):
+    u = _get_or_create_user(user_id)
+    if not _is_premium_from_doc(u):
         return False, 0
-    _get_or_create_user(user_id)
-    _maybe_reset(user_id, "daily_summary_count", "summary_reset")
-    u = users.find_one({"user_id": user_id})
+    _maybe_reset_from_doc(user_id, u, "daily_summary_count", "summary_reset")
     count = u.get("daily_summary_count", 0)
     remaining = max(0, PREMIUM_SUMMARY_DAILY - count)
     return remaining > 0, remaining
@@ -133,10 +135,9 @@ def add_to_history(user_id: int, query: str):
 
 
 def get_history(user_id: int) -> list:
-    _get_or_create_user(user_id)
-    u = users.find_one({"user_id": user_id})
+    u = _get_or_create_user(user_id)
     history = u.get("search_history", [])
-    limit = PREMIUM_HISTORY_SHOWN if is_premium(user_id) else FREE_HISTORY_SHOWN
+    limit = PREMIUM_HISTORY_SHOWN if _is_premium_from_doc(u) else FREE_HISTORY_SHOWN
     return history[:limit]
 
 

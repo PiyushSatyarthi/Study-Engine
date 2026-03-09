@@ -2,7 +2,9 @@
 Search suggestions — generated from actual indexed topics in the DB,
 not a hardcoded lookup table. Falls back to hardcoded if DB is empty.
 """
+import re
 from db import resources
+from constants import QUESTION_STOPWORDS as STOPWORDS
 
 
 def get_suggestions(query: str, n: int = 3) -> list:
@@ -17,17 +19,11 @@ def get_suggestions(query: str, n: int = 3) -> list:
 
     # Pull topics from DB that share meaningful tokens with the query
     # Exclude stopwords and the query itself
-    stopwords = {
-        "a", "an", "the", "of", "in", "on", "at", "to", "for", "and", "or",
-        "is", "it", "its", "what", "how", "why", "does", "explain", "discuss",
-        "define", "role", "impact", "effect", "process", "between", "with",
-        "that", "this", "are", "was", "were", "have", "has", "using", "based"
-    }
     tokens = [
         t.strip(".,;:()?!")
         for t in q.split()
         if len(t.strip(".,;:()?!")) > 3
-        and t.strip(".,;:()?!") not in stopwords
+        and t.strip(".,;:()?!") not in STOPWORDS
     ]
 
     if not tokens:
@@ -35,7 +31,6 @@ def get_suggestions(query: str, n: int = 3) -> list:
 
     # Find distinct topics in DB that contain any of these tokens
     # Use a $or regex match on the topic field
-    import re
     regex_parts = [{"topic": {"$regex": t, "$options": "i"}} for t in tokens]
 
     try:
@@ -59,7 +54,7 @@ def get_suggestions(query: str, n: int = 3) -> list:
                 continue
             t_tokens = set(
                 w.strip(".,;:()?!") for w in t_lower.split()
-                if len(w.strip(".,;:()?!")) > 3 and w not in stopwords
+                if len(w.strip(".,;:()?!")) > 3 and w not in STOPWORDS
             )
             # Skip if it shares ALL tokens with query (near-duplicate)
             if t_tokens and t_tokens.issubset(seen_tokens):

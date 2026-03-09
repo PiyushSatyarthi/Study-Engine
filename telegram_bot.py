@@ -28,9 +28,8 @@ from features.saved_papers import save_paper, unsave_paper, get_saved_papers, ad
 from features.collections_feature import create_collection, delete_collection, list_collections
 from features.alerts import add_alert, remove_alert, list_alerts
 from features.export_pdf import generate_export_pdf
-from features.ask_paper import ask_paper
-from features.multi_summary import compare_papers, MAX_PAPERS
-from features.suggestions import get_suggestions
+from llm_summarizer import MAX_PAPERS
+from suggestions import get_suggestions
 from features.digest import run_digest_scheduler
 
 load_dotenv()
@@ -45,7 +44,20 @@ crawling_lock = threading.Lock()
 CRAWL_COOLDOWN_SECONDS = 600
 
 # Tracks users who sent /assignment and are waiting to send their content
+# Entries include a timestamp for TTL-based cleanup
 assignment_sessions = {}
+SESSION_TTL_SECONDS = 600  # 10 minutes
+
+
+def _cleanup_stale_sessions():
+    """Remove assignment sessions older than SESSION_TTL_SECONDS."""
+    now = datetime.now(timezone.utc)
+    stale = [
+        uid for uid, s in assignment_sessions.items()
+        if (now - s.get("created_at", now)).total_seconds() > SESSION_TTL_SECONDS
+    ]
+    for uid in stale:
+        assignment_sessions.pop(uid, None)
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -141,7 +153,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/saved — view your saved papers\n"
         "/collections — group papers into collections ✨\n"
         "/export — export your library as PDF ✨\n"
-        "/history — your recent searches",
+        "/history — your recent searches\n"
         "/setlevel — set your education level (affects answer depth & style)",
         parse_mode="Markdown"
     )
@@ -725,7 +737,8 @@ async def assignment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    assignment_sessions[user_id] = {"step": "waiting_for_content"}
+    _cleanup_stale_sessions()
+    assignment_sessions[user_id] = {"step": "waiting_for_content", "created_at": datetime.now(timezone.utc)}
 
     await update.message.reply_text(
         "📋 Assignment Analyzer\n\n"
@@ -821,7 +834,8 @@ async def assignment_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Got content — ask what the user wants
     assignment_sessions[user_id] = {
         "step": "choose_mode",
-        "text": assignment_text
+        "text": assignment_text,
+        "created_at": datetime.now(timezone.utc)
     }
 
     keyboard = InlineKeyboardMarkup([
@@ -935,8 +949,11 @@ async def assignment_regen_callback(update: Update, context: ContextTypes.DEFAUL
 
     loop = asyncio.get_event_loop()
 
+    user_id = query.from_user.id
+
     def run_regen():
         from assignment_analyzer import _gather_relevant_papers, generate_answer
+        from users import get_education_level
         q = {
             "number": data['number'],
             "question": data['question'],
@@ -944,7 +961,8 @@ async def assignment_regen_callback(update: Update, context: ContextTypes.DEFAUL
             "topics": data.get('topics', [])
         }
         q['papers'] = _gather_relevant_papers(q['question'], q['topics'])
-        return generate_answer(q, q['papers'], force_regenerate=True)
+        return generate_answer(q, q['papers'], force_regenerate=True,
+                               level=get_education_level(user_id))
 
     try:
         result = await loop.run_in_executor(None, run_regen)
@@ -1028,13 +1046,6 @@ async def _send_answers(bot, chat_id: int, questions: list, total: int):
         # Show Regenerate button only for KB answers
         keyboard = None
         if from_kb:
-            import json
-            regen_data = json.dumps({
-                "q": q['question'],
-                "t": q.get('type', 'factual'),
-                "topics": q.get('topics', [])
-            })
-            # Store regen data in bot's user_data keyed by a short id
             regen_id = f"{chat_id}_{q['number']}"
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
@@ -1045,12 +1056,21 @@ async def _send_answers(bot, chat_id: int, questions: list, total: int):
             # Store the question data so callback can retrieve it
             if not hasattr(bot, '_regen_store'):
                 bot._regen_store = {}
+            # Clean up stale regen entries (older than 30 minutes)
+            _now = datetime.now(timezone.utc)
+            stale_keys = [
+                k for k, v in bot._regen_store.items()
+                if (_now - v.get("stored_at", _now)).total_seconds() > 1800
+            ]
+            for k in stale_keys:
+                bot._regen_store.pop(k, None)
             bot._regen_store[regen_id] = {
                 "question": q['question'],
                 "type": q.get('type', 'factual'),
                 "topics": q.get('topics', []),
                 "number": q['number'],
-                "chat_id": chat_id
+                "chat_id": chat_id,
+                "stored_at": datetime.now(timezone.utc)
             }
 
         try:

@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import datetime, timezone
+import re
 
 from crawlers.arxiv import search_arxiv
 from crawlers.pubmed import search_pubmed
@@ -6,6 +7,8 @@ from crawlers.doab import search_doab
 from crawlers.semantic_scholar import search_semantic_scholar
 from crawlers.github_learning import search_github_learning
 from crawlers.mit_ocw import search_mit_ocw
+
+from constants import STOPWORDS
 
 from db import resources
 from embeddings import embed
@@ -48,11 +51,6 @@ def is_relevant_to_topic(r: dict, topic: str) -> bool:
     Requires at least 1 meaningful topic token to appear in title or summary.
     Prevents completely unrelated papers from polluting the DB.
     """
-    STOPWORDS = {
-        "a", "an", "the", "of", "in", "on", "at", "to", "for",
-        "and", "or", "is", "it", "its", "be", "by", "as", "with",
-        "study", "based", "using", "via", "from"
-    }
     tokens = [t for t in topic.lower().split() if t not in STOPWORDS and len(t) > 3]
 
     if not tokens:
@@ -60,7 +58,6 @@ def is_relevant_to_topic(r: dict, topic: str) -> bool:
 
     text = (r.get("title", "") + " " + r.get("summary", "")).lower()
 
-    import re
     for token in tokens:
         pattern = r'(?<![a-z])' + re.escape(token) + r'(?![a-z])'
         if re.search(pattern, text):
@@ -113,7 +110,7 @@ def index_topic(topic):
             "pdf": r["pdf"],
             "topic": topic,
             "embedding": vector,
-            "indexed_at": datetime.utcnow().replace(microsecond=0)
+            "indexed_at": datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
         }
 
         resources.insert_one(doc)
