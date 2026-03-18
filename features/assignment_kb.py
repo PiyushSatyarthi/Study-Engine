@@ -39,7 +39,7 @@ def find_similar_answer(question: str) -> dict | None:
     """
     try:
         embedding = embed_query(question)
-        if not embedding or all(v == 0.0 for v in embedding):
+        if not embedding:
             return None
 
         pipeline = [
@@ -83,7 +83,7 @@ def store_answer(question: str, topics: list, answer_result: dict):
     """
     try:
         embedding = embed_query(question)
-        if not embedding or all(v == 0.0 for v in embedding):
+        if not embedding:
             print("[kb] Skipping store — embedding failed")
             return
 

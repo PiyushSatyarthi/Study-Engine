@@ -14,7 +14,8 @@ def search_semantic_scholar(query, max_results=20):
     try:
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
-    except:
+    except Exception as e:
+        print(f"Semantic Scholar request error: {e}")
         return []
 
     results = []

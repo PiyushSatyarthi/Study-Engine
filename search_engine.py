@@ -4,6 +4,7 @@ from functools import lru_cache
 from datetime import datetime, timezone
 from constants import STOPWORDS
 import re
+import time
 
 VECTOR_WEIGHT = 0.7
 KEYWORD_WEIGHT = 0.5
@@ -13,28 +14,36 @@ DOMAIN_BOOST = {
     "pubmed": 1.3,
     "semantic_scholar": 1.15,
     "arxiv": 1.0,
+    "openalex": 1.0,
+    "core": 0.95,
     "mit_ocw": 0.9,
+    "doab": 0.85,
     "github": 0.8,
-    "doab": 0.85
 }
 
 # Only crawl for more if fewer than this many results AND relevance is also poor
 MIN_RESULTS_THRESHOLD = 5
+SEARCH_CACHE_TTL_SECONDS = 600
+_SEARCH_CACHE: dict[tuple[str, int], tuple[float, list, bool]] = {}
 
 
 @lru_cache(maxsize=200)
 def get_query_embedding(query: str):
-    return tuple(embed_query(query))
+    vec = embed_query(query)
+    return tuple(vec) if vec else None
 
 
 def vector_search(query: str, limit: int = 40):
     try:
         query_vector = get_query_embedding(query)
+        if not query_vector:
+            return []
         pipeline = [
             {
                 "$vectorSearch": {
                     "index": "vector_index",
                     "path": "embedding",
+                    "filter": {"embedding_failed": {"$ne": True}},
                     "queryVector": list(query_vector),
                     "numCandidates": 200,
                     "limit": limit
@@ -274,6 +283,12 @@ def search(query: str, limit: int = 20):
     """
     print(f"[search] Query: '{query}'")
 
+    cache_key = (query.lower().strip(), limit)
+    now_ts = time.time()
+    cached = _SEARCH_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < SEARCH_CACHE_TTL_SECONDS:
+        return cached[1], cached[2]
+
     is_empty = resources.find_one({}, {"_id": 1}) is None
     print(f"[search] DB empty: {is_empty}")
 
@@ -289,7 +304,9 @@ def search(query: str, limit: int = 20):
         fallback = fallback_search(query, limit=limit)
         if fallback:
             filtered, needs_crawl = relevance_filter(fallback, query)
-            return (filtered or fallback)[:limit], True
+            final = (filtered or fallback)[:limit]
+            _SEARCH_CACHE[cache_key] = (now_ts, final, True)
+            return final, True
         return [], True
 
     ranked = hybrid_rank(vector_results, keyword_results, limit=limit * 2)
@@ -301,4 +318,6 @@ def search(query: str, limit: int = 20):
         return [], True
 
     print(f"[search] Final results: {len(filtered[:limit])}")
-    return filtered[:limit], needs_crawl
+    final = filtered[:limit]
+    _SEARCH_CACHE[cache_key] = (now_ts, final, needs_crawl)
+    return final, needs_crawl

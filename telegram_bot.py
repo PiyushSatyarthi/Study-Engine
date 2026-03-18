@@ -1,13 +1,18 @@
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import os
 import asyncio
+import functools
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler,
     CommandHandler, ContextTypes, MessageHandler, filters
 )
+
+# Shared thread pool for offloading blocking calls (LLM, search, DB)
+_executor = ThreadPoolExecutor(max_workers=20)
 
 from db import resources, sessions, users
 from crawler_worker import index_topic
@@ -31,6 +36,23 @@ from features.export_pdf import generate_export_pdf
 from llm_summarizer import MAX_PAPERS
 from suggestions import get_suggestions
 from features.digest import run_digest_scheduler
+from features.advanced_research import (
+    build_citation_graph,
+    create_study_plan,
+    get_study_plan,
+    generate_flashcards,
+    recommend_for_user,
+    generate_mindmap_from_papers,
+    detect_overlap,
+    find_research_gaps,
+    generate_literature_review,
+)
+from features.collab_collections import (
+    share_collection,
+    join_shared_collection,
+    list_shared_memberships,
+    get_shared_papers,
+)
 
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
@@ -43,10 +65,20 @@ crawl_cooldowns = {}
 crawling_lock = threading.Lock()
 CRAWL_COOLDOWN_SECONDS = 600
 
+
+async def run_blocking(func, *args, **kwargs):
+    """Offload a blocking function to the thread pool so the event loop stays free."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _executor,
+        functools.partial(func, *args, **kwargs)
+    )
+
 # Tracks users who sent /assignment and are waiting to send their content
 # Entries include a timestamp for TTL-based cleanup
 assignment_sessions = {}
 SESSION_TTL_SECONDS = 600  # 10 minutes
+eli5_store = {}
 
 
 def _cleanup_stale_sessions():
@@ -197,7 +229,7 @@ async def study(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Searching...")
 
     result_limit = get_results_limit(user_id)
-    results, needs_crawl = search(query, limit=result_limit)
+    results, needs_crawl = await run_blocking(search, query, limit=result_limit)
     topic_key = query.lower()
 
     if results:
@@ -209,7 +241,7 @@ async def study(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_premium(user_id):
             msg += f"\n\nShowing {result_limit}/20 results. /premium for full access."
 
-        suggestions = get_suggestions(query)
+        suggestions = await run_blocking(get_suggestions, query)
         if suggestions:
             msg += "\n\nRelated topics:\n" + " | ".join(f"/study {s}" for s in suggestions)
 
@@ -258,7 +290,7 @@ async def page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def crawl_and_notify(query: str, chat_id: int, application,
                             silent: bool = False, user_id: int = None):
     try:
-        await asyncio.get_event_loop().run_in_executor(None, index_topic, query)
+        await asyncio.get_event_loop().run_in_executor(_executor, index_topic, query)
     except Exception as e:
         print(f"[crawl] Error for '{query}': {e}")
     finally:
@@ -267,7 +299,7 @@ async def crawl_and_notify(query: str, chat_id: int, application,
             crawl_cooldowns[query.lower()] = now_utc()
 
     result_limit = get_results_limit(user_id) if user_id else 5
-    results, _ = search(query, limit=result_limit)
+    results, _ = await run_blocking(search, query, limit=result_limit)
 
     if silent and results:
         if user_id:
@@ -286,7 +318,7 @@ async def crawl_and_notify(query: str, chat_id: int, application,
     if user_id and not is_premium(user_id):
         msg += f"\n\nShowing {result_limit}/20 results. /premium for full access."
 
-    suggestions = get_suggestions(query)
+    suggestions = await run_blocking(get_suggestions, query)
     if suggestions:
         msg += "\n\nRelated topics:\n" + " | ".join(f"/study {s}" for s in suggestions)
 
@@ -499,14 +531,14 @@ async def summarize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = doc.get(cache_field)
     if not summary:
         await update.message.reply_text(f"Generating summary [{level['short']}]...")
-        summary = summarize_text(doc.get("summary", ""), level=level)
-        resources.update_one({"_id": doc["_id"]}, {"$set": {cache_field: summary}})
+        summary = await run_blocking(summarize_text, doc.get("summary", ""), level=level)
+        await run_blocking(resources.update_one, {"_id": doc["_id"]}, {"$set": {cache_field: summary}})
         increment_summary_usage(user_id)
 
     await update.message.reply_text(f"📄 Summary [{level['short']}]\n\n{summary}")
 
     related_query = doc.get("topic") or doc.get("title", "")
-    related = search_related(related_query, current_pdf=doc["pdf"], limit=4)
+    related = await run_blocking(search_related, related_query, current_pdf=doc["pdf"], limit=4)
     if related:
         text = "Related Papers\n\n"
         for r in related:
@@ -535,7 +567,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("Thinking...")
     level = get_education_level(user_id)
-    answer = _ask_paper_fn(doc.get("summary", ""), question, doc.get("title", ""), level=level)
+    answer = await run_blocking(_ask_paper_fn, doc.get("summary", ""), question, doc.get("title", ""), level=level)
     await update.message.reply_text(f"Answer\n\n{answer}")
 
 
@@ -564,8 +596,245 @@ async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Comparing papers...")
     level = get_education_level(user_id)
-    result = _compare_papers_fn(papers, level=level)
+    result = await run_blocking(_compare_papers_fn, papers, level=level)
     await update.message.reply_text(f"Comparison\n\n{result}")
+
+
+async def citegraph(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /citegraph <paper_link>")
+        return
+
+    await update.message.reply_text("Building citation graph...")
+    data = await run_blocking(build_citation_graph, context.args[0])
+    if data.get("error"):
+        await update.message.reply_text(f"{data['error']}")
+        return
+
+    msg = (
+        f"Citation Graph\n\n{data['title']}\n{data.get('url','')}\n"
+        f"Citations: {data.get('citation_count', 0)}\n"
+    )
+    refs = data.get("references", [])
+    if refs:
+        msg += "\nReferences:\n"
+        for r in refs[:6]:
+            msg += f"- {r['title']}\n"
+
+    cites = data.get("citations", [])
+    if cites:
+        msg += "\nCited By:\n"
+        for c in cites[:6]:
+            msg += f"- {c['title']}\n"
+
+    await update.message.reply_text(msg[:3900])
+
+
+async def studyplan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_premium(user_id):
+        await update.message.reply_text("Study plans require premium.\n/premium")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /studyplan <days> <topic>\nExample: /studyplan 14 transformers")
+        return
+    try:
+        days = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("First argument must be number of days.")
+        return
+
+    topic = " ".join(context.args[1:]).strip()
+    if not topic:
+        await update.message.reply_text("Please provide a topic.")
+        return
+
+    await update.message.reply_text("Generating your study plan...")
+    result = await run_blocking(create_study_plan, user_id, topic, days, get_education_level(user_id))
+    if result.get("error"):
+        await update.message.reply_text(result["error"])
+        return
+    await update.message.reply_text(f"Study Plan ({result['days']} days)\nTopic: {result['topic']}\n\n{result['plan_text'][:3700]}")
+
+
+async def myplan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    topic = " ".join(context.args).strip() if context.args else None
+    plan = await run_blocking(get_study_plan, user_id, topic)
+    if not plan:
+        await update.message.reply_text("No saved plan found. Create one with /studyplan <days> <topic>")
+        return
+    await update.message.reply_text(
+        f"Saved Plan\nTopic: {plan.get('topic_display', plan.get('topic',''))}\nDays: {plan.get('days', '?')}\n\n{plan.get('plan_text','')[:3600]}"
+    )
+
+
+async def flashcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_premium(user_id):
+        await update.message.reply_text("Flashcards require premium.\n/premium")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /flashcards <paper_link>")
+        return
+    doc = resources.find_one({"pdf": context.args[0]})
+    if not doc:
+        await update.message.reply_text("Paper not found. Search first with /study.")
+        return
+    await update.message.reply_text("Generating flashcards...")
+    cards = await run_blocking(generate_flashcards, doc, get_education_level(user_id), 8)
+    await update.message.reply_text(f"Flashcards\n\n{cards[:3800]}")
+
+
+async def recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    recs = await run_blocking(recommend_for_user, user_id, 8)
+    if not recs:
+        await update.message.reply_text("No recommendations yet. Use /study and /save more papers first.")
+        return
+    msg = "Recommended For You\n\n"
+    for i, r in enumerate(recs, 1):
+        msg += f"{i}. {r.get('title','Untitled')}\n{r.get('pdf','')}\n\n"
+    await update.message.reply_text(msg[:3900])
+
+
+async def mindmap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_premium(user_id):
+        await update.message.reply_text("Mindmap requires premium.\n/premium")
+        return
+    collection = " ".join(context.args).strip() if context.args else None
+    papers = get_saved_papers(user_id, collection)
+    if not papers:
+        await update.message.reply_text("No papers available. Save papers first with /save.")
+        return
+
+    enriched = []
+    for p in papers[:10]:
+        doc = resources.find_one({"pdf": p.get("pdf")})
+        if doc:
+            enriched.append(doc)
+    if not enriched:
+        await update.message.reply_text("Could not load paper details from DB.")
+        return
+
+    topic = collection or "My saved papers"
+    await update.message.reply_text("Generating mindmap...")
+    graph = await run_blocking(generate_mindmap_from_papers, topic, enriched, get_education_level(user_id))
+    await update.message.reply_text(f"Mermaid Mindmap\n\n```\n{graph[:3600]}\n```", parse_mode="Markdown")
+
+
+async def eli5(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /eli5 <paper_link>")
+        return
+    doc = resources.find_one({"pdf": context.args[0]})
+    if not doc:
+        await update.message.reply_text("Paper not found. Search first with /study.")
+        return
+    prompt = (
+        "Explain this research paper in very simple terms for a 12-year-old. "
+        "Use short sentences and one everyday analogy. Keep under 140 words.\n\n"
+        f"Title: {doc.get('title','')}\nAbstract: {doc.get('summary','')[:1800]}"
+    )
+    await update.message.reply_text("Simplifying...")
+    from llm_client import call_llm
+    answer = await run_blocking(call_llm, prompt, 220, 0.4)
+    await update.message.reply_text(f"ELI5\n\n{(answer or 'Could not generate explanation right now.')[:3900]}")
+
+
+async def overlap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = " ".join(context.args).strip()
+    if len(user_text) < 30:
+        await update.message.reply_text("Usage: /overlap <your paragraph>")
+        return
+    await update.message.reply_text("Checking semantic overlap...")
+    matches = await run_blocking(detect_overlap, user_text, 5)
+    if not matches:
+        await update.message.reply_text("No strong overlap found.")
+        return
+    msg = "Potential Overlap Matches\n\n"
+    for i, m in enumerate(matches, 1):
+        pct = int(m["score"] * 100)
+        msg += f"{i}. {m['title']}\nSimilarity: {pct}%\n{m['pdf']}\n\n"
+    await update.message.reply_text(msg[:3900])
+
+
+async def sharecollection_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_premium(user_id):
+        await update.message.reply_text("Sharing collections requires premium.\n/premium")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /sharecollection <collection_name>")
+        return
+    ok, msg = await run_blocking(share_collection, user_id, " ".join(context.args))
+    await update.message.reply_text(msg)
+
+
+async def joincollection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /joincollection <code>")
+        return
+    ok, msg = await run_blocking(join_shared_collection, update.effective_user.id, context.args[0])
+    await update.message.reply_text(msg)
+
+
+async def myshared(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    joins = await run_blocking(list_shared_memberships, update.effective_user.id)
+    if not joins:
+        await update.message.reply_text("No shared collections joined yet.")
+        return
+    msg = "Shared Collections\n\n"
+    for j in joins:
+        msg += f"- {j['collection_name']} (code: {j['code']})\n"
+    msg += "\nView papers: /sharedpapers <code>"
+    await update.message.reply_text(msg)
+
+
+async def sharedpapers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /sharedpapers <code>")
+        return
+    ok, collection_name, papers = await run_blocking(get_shared_papers, update.effective_user.id, context.args[0])
+    if not ok:
+        await update.message.reply_text(collection_name)
+        return
+    if not papers:
+        await update.message.reply_text(f"Shared collection '{collection_name}' is empty.")
+        return
+    msg = f"Shared Papers - {collection_name}\n\n"
+    for i, p in enumerate(papers, 1):
+        msg += f"{i}. {p.get('title','Untitled')}\n{p.get('pdf','')}\n\n"
+    await update.message.reply_text(msg[:3900])
+
+
+async def gaps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_premium(user_id):
+        await update.message.reply_text("Research gap finder requires premium.\n/premium")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /gaps <topic>")
+        return
+    topic = " ".join(context.args)
+    await update.message.reply_text("Analyzing papers for research gaps...")
+    text = await run_blocking(find_research_gaps, topic, get_education_level(user_id))
+    await update.message.reply_text(f"Research Gaps: {topic}\n\n{text[:3700]}")
+
+
+async def litreview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_premium(user_id):
+        await update.message.reply_text("Literature review requires premium.\n/premium")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /litreview <topic>")
+        return
+    topic = " ".join(context.args)
+    await update.message.reply_text("Generating structured literature review...")
+    text = await run_blocking(generate_literature_review, topic, get_education_level(user_id))
+    await update.message.reply_text(f"Literature Review: {topic}\n\n{text[:3700]}")
 
 
 # ── /setalert /removealert /alerts ────────────────────────────
@@ -894,7 +1163,7 @@ async def assignment_mode_callback(update: Update, context: ContextTypes.DEFAULT
 
     try:
         result = await loop.run_in_executor(
-            None,
+            _executor,
             lambda: analyze_assignment(assignment_text, mode=mode,
                                          level=get_education_level(query.from_user.id))
         )
@@ -965,7 +1234,7 @@ async def assignment_regen_callback(update: Update, context: ContextTypes.DEFAUL
                                level=get_education_level(user_id))
 
     try:
-        result = await loop.run_in_executor(None, run_regen)
+        result = await loop.run_in_executor(_executor, run_regen)
         await _send_answers(bot, data['chat_id'], [result], 1)
     except Exception as e:
         print(f"[assignment] Regen error: {e}")
@@ -984,7 +1253,7 @@ async def _send_topic_map(bot, chat_id: int, questions: list, total: int):
         text=f"📋 Assignment Analysis — {total} question(s) found\n\nTopics to study for each question:"
     )
 
-    type_emoji = {"factual": "🔬", "essay": "✍️", "numerical": "🔢", "definition": "📖"}
+    type_emoji = {"factual": "🔬", "essay": "✍️", "numerical": "🔢", "definition": "📖", "explain": "💡"}
 
     for q in questions:
         topics = q.get("topics", [])
@@ -1121,6 +1390,13 @@ def run_bot():
         ("export", export), ("collections", collections_cmd),
         ("newcollection", new_collection), ("delcollection", del_collection),
         ("summarize", summarize), ("ask", ask), ("compare", compare),
+        ("eli5", eli5), ("citegraph", citegraph),
+        ("studyplan", studyplan_cmd), ("myplan", myplan),
+        ("flashcards", flashcards), ("recommend", recommend),
+        ("mindmap", mindmap), ("overlap", overlap),
+        ("sharecollection", sharecollection_cmd), ("joincollection", joincollection),
+        ("myshared", myshared), ("sharedpapers", sharedpapers),
+        ("gaps", gaps), ("litreview", litreview),
         ("setalert", setalert), ("removealert", removealert), ("alerts", myalerts),
         ("digest", digest), ("setlevel", setlevel), ("premium", premium), ("givepremium", givepremium),
         ("assignment", assignment),

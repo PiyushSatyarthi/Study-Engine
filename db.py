@@ -6,7 +6,7 @@ load_dotenv()
 
 client = MongoClient(
     os.getenv("MONGO_URI"),
-    maxPoolSize=10,
+    maxPoolSize=50,
     serverSelectionTimeoutMS=5000
 )
 
@@ -20,6 +20,9 @@ saved       = db["saved_papers"]
 collections = db["collections"]
 alerts      = db["alerts"]
 digest_log  = db["digest_log"]
+study_plans = db["study_plans"]
+shared_collections = db["shared_collections"]
+collection_members = db["collection_members"]
 
 
 def ensure_indexes():
@@ -30,18 +33,18 @@ def ensure_indexes():
     resources.create_index("source")
     resources.create_index("indexed_at")
 
+    # Only create text index if it doesn't already exist
     existing = resources.index_information()
-    for name, info in existing.items():
-        if "text" in [v for _, v in info.get("key", [])]:
-            print(f"[db] Dropping old text index: {name}")
-            resources.drop_index(name)
-            break
-
-    resources.create_index(
-        [("title", TEXT), ("summary", TEXT), ("search_text", TEXT)],
-        weights={"title": 10, "summary": 5, "search_text": 1},
-        name="text_search_index"
+    has_text = any(
+        "text" in [v for _, v in info.get("key", [])]
+        for info in existing.values()
     )
+    if not has_text:
+        resources.create_index(
+            [("title", TEXT), ("summary", TEXT), ("search_text", TEXT)],
+            weights={"title": 10, "summary": 5, "search_text": 1},
+            name="text_search_index"
+        )
 
     # ── users ──────────────────────────────────────────────────
     users.create_index("user_id", unique=True)
@@ -67,6 +70,16 @@ def ensure_indexes():
     # ── digest log — auto-expire after 7 days ─────────────────
     digest_log.create_index([("user_id", 1), ("date", 1)], unique=True)
     digest_log.create_index("sent_at", expireAfterSeconds=604800)
+
+    # ── study plans ────────────────────────────────────────────
+    study_plans.create_index([("user_id", 1), ("topic", 1)], unique=True)
+    study_plans.create_index("updated_at")
+
+    # ── collaborative collections ──────────────────────────────
+    shared_collections.create_index("code", unique=True)
+    shared_collections.create_index([("owner_user_id", 1), ("collection_name", 1)], unique=True)
+    collection_members.create_index([("code", 1), ("user_id", 1)], unique=True)
+    collection_members.create_index("user_id")
 
     # ── assignment answers knowledge base ──────────────────────
     # Stores LLM-generated answers with embeddings for semantic search.

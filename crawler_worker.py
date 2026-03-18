@@ -7,6 +7,8 @@ from crawlers.doab import search_doab
 from crawlers.semantic_scholar import search_semantic_scholar
 from crawlers.github_learning import search_github_learning
 from crawlers.mit_ocw import search_mit_ocw
+from crawlers.openalex import search_openalex
+from crawlers.core_ac import search_core
 
 from constants import STOPWORDS
 
@@ -74,6 +76,8 @@ def index_topic(topic):
         search_pubmed,
         search_doab,
         search_semantic_scholar,
+        search_openalex,
+        search_core,
         search_github_learning,
         search_mit_ocw
     ]
@@ -100,6 +104,11 @@ def index_topic(topic):
         text = (r["title"] + ". " + r["summary"])[:2000]
         vector = embed(text)
 
+        # Skip vector insertion when embedding fails to avoid poisoning search index.
+        if not vector:
+            print(f"[crawl] Skipping {r['pdf']} due to embedding failure")
+            continue
+
         doc = {
             "title": r["title"],
             "summary": r["summary"],
@@ -110,6 +119,7 @@ def index_topic(topic):
             "pdf": r["pdf"],
             "topic": topic,
             "embedding": vector,
+            "embedding_failed": False,
             "indexed_at": datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
         }
 

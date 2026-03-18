@@ -95,7 +95,18 @@ async def razorpay_webhook(request: Request):
             user_id,
             "🎉 Payment Successful!\n\n"
             "💎 Premium activated for 30 days.\n\n"
-            "You can now use AI summaries."
+            "You now have access to:\n"
+            "• 50 searches/day  • 20 results/search\n"
+            "• 20 AI summaries/day\n"
+            "• /ask — Q&A on any paper\n"
+            "• /compare — compare up to 3 papers\n"
+            "• /collections — organise your library\n"
+            "• /export — PDF export\n"
+            "• /setalert — topic alerts\n"
+            "• /digest — daily research digest\n"
+            "• /assignment — assignment analyzer\n"
+            "• /studyplan, /flashcards, /mindmap, /gaps, /litreview\n\n"
+            "Use /start to see all commands."
         )
 
         print("Premium activated for user:", user_id)
